@@ -12,7 +12,7 @@ from metrics import StreamSegMetrics
 
 import torch
 import torch.nn as nn
-from utils.visualizer import Visualizer
+# from utils.visualizer import Visualizer
 
 from PIL import Image
 import matplotlib
@@ -66,7 +66,7 @@ def get_argparser():
 
     parser.add_argument("--loss_type", type=str, default='cross_entropy',
                         choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
-    parser.add_argument("--gpu_id", type=str, default='2',
+    parser.add_argument("--gpu_id", type=str, default='0',
                         help="GPU ID")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                         help='weight decay (default: 1e-4)')
@@ -176,10 +176,10 @@ def main():
     opts.num_classes = 3
 
     # Setup visualization
-    vis = Visualizer(port=opts.vis_port,
-                     env=opts.vis_env) if opts.enable_vis else None
-    if vis is not None:  # display options
-        vis.vis_table("Options", vars(opts))
+    # vis = Visualizer(port=opts.vis_port,
+    #                  env=opts.vis_env) if opts.enable_vis else None
+    # if vis is not None:  # display options
+    #     vis.vis_table("Options", vars(opts))
 
     os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -277,7 +277,7 @@ def main():
     if opts.test_only:
         model.eval()
         val_score, ret_samples = validate(
-            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
+            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics)
         print(metrics.to_str(val_score))
         return
 
@@ -300,8 +300,8 @@ def main():
 
             np_loss = loss.detach().cpu().numpy()
             interval_loss += np_loss
-            if vis is not None:
-                vis.vis_scalar('Loss', cur_itrs, np_loss)
+            # if vis is not None:
+            #     vis.vis_scalar('Loss', cur_itrs, np_loss)
 
             if (cur_itrs) % 10 == 0:
                 interval_loss = interval_loss / 10
@@ -316,24 +316,24 @@ def main():
                 model.eval()
                 val_score, ret_samples = validate(
                     opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
-                    ret_samples_ids=vis_sample_id)
+                    )
                 print(metrics.to_str(val_score))
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
                     save_ckpt('checkpoints/best_%s_os%d.pth' %
                               (opts.model, opts.output_stride))
 
-                if vis is not None:  # visualize validation score and samples
-                    vis.vis_scalar("[Val] Overall Acc", cur_itrs, val_score['Overall Acc'])
-                    vis.vis_scalar("[Val] Mean IoU", cur_itrs, val_score['Mean IoU'])
-                    vis.vis_table("[Val] Class IoU", val_score['Class IoU'])
-
-                    for k, (img, target, lbl) in enumerate(ret_samples):
-                        img = (denorm(img) * 255).astype(np.uint8)
-                        target = train_dst.decode_target(target).transpose(2, 0, 1).astype(np.uint8)
-                        lbl = train_dst.decode_target(lbl).transpose(2, 0, 1).astype(np.uint8)
-                        concat_img = np.concatenate((img, target, lbl), axis=2)  # concat along width
-                        vis.vis_image('Sample %d' % k, concat_img)
+                # if vis is not None:  # visualize validation score and samples
+                #     vis.vis_scalar("[Val] Overall Acc", cur_itrs, val_score['Overall Acc'])
+                #     vis.vis_scalar("[Val] Mean IoU", cur_itrs, val_score['Mean IoU'])
+                #     vis.vis_table("[Val] Class IoU", val_score['Class IoU'])
+                #
+                #     for k, (img, target, lbl) in enumerate(ret_samples):
+                #         img = (denorm(img) * 255).astype(np.uint8)
+                #         target = train_dst.decode_target(target).transpose(2, 0, 1).astype(np.uint8)
+                #         lbl = train_dst.decode_target(lbl).transpose(2, 0, 1).astype(np.uint8)
+                #         concat_img = np.concatenate((img, target, lbl), axis=2)  # concat along width
+                #         vis.vis_image('Sample %d' % k, concat_img)
                 model.train()
             scheduler.step()
 

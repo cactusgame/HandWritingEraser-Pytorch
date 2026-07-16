@@ -8,7 +8,7 @@ import argparse
 import numpy as np
 
 from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes, cityscapes
+# from datasets import VOCSegmentation, Cityscapes, cityscapes
 from torchvision import transforms as T
 from metrics import StreamSegMetrics
 

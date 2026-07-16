@@ -12,3 +12,5 @@ datasets/data/cityscapes
 test_results
 a.py
 get_date.py
+/sync.sh
+/tmp_img.png

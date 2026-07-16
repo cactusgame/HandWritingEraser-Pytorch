@@ -201,9 +201,11 @@ def main():
     opts = argparse.ArgumentParser()
     opts.add_argument("--mode_path", type=str, default="checkpoints/best_deeplabv3plus_resnet50_os16.pth")
     opts.add_argument("--device", type=str, default='1')
-    opts.add_argument("--data_path", type=str, default='/home/disk2/ray/datasets/HandWriting/dehw_testA_dataset/images')
+    opts.add_argument("--data_path", type=str, default='/home/peng/Documents/data/test/手写清除')
     opts.add_argument('--test_one', type=str,
-                      default='/home/disk2/ray/datasets/HandWriting/dehw_testA_dataset/images/dehw_testA_00015.jpg')
+                      default='/home/peng/Documents/data/test/手写清除/长试卷.jpg')
+
+
     transform = T.Compose([
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406],
@@ -215,7 +217,8 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = opts.device
     opts.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = network.modeling.deeplabv3plus_resnet101(num_classes=3, output_stride=16)
+    # model = network.modeling.deeplabv3plus_resnet101(num_classes=3, output_stride=16)
+    model = network.modeling.deeplabv3plus_resnet50(num_classes=2, output_stride=8)
     # network.convert_to_separable_conv(model.classifier)
     checkpoint = torch.load(opts.mode_path, map_location=torch.device('cpu'))
     model.load_state_dict(checkpoint["model_state"])
