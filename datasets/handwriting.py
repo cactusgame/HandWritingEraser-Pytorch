@@ -1,4 +1,6 @@
+import json
 import random
+import re
 from collections import namedtuple
 from pathlib import Path
 
@@ -8,7 +10,13 @@ from PIL import Image
 
 
 class HWSegmentation(data.Dataset):
-    """Paired document images and three-class segmentation labels."""
+    """One Baidu-format handwriting dataset source.
+
+    A source contains ``Images/`` and ``Labels/``. If ``splits/<split>.txt``
+    exists it is authoritative; otherwise a deterministic grouped train/val
+    split is generated. Grouping keeps Baidu variants such as ``*_00`` and
+    ``*_01`` together and prevents augmented siblings leaking into validation.
+    """
 
     HandWClass = namedtuple(
         "HandWClass",
@@ -32,64 +40,69 @@ class HWSegmentation(data.Dataset):
     train_id_to_color = np.array([c.color for c in classes])
     id_to_train_id = np.array([c.train_id for c in classes])
     valid_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    variant_suffix = re.compile(r"^(?P<group>.+)_\d{2}$")
 
     def __init__(
         self,
         root,
         transform=None,
-        train=True,
+        split=None,
+        train=None,
         val_ratio=0.15,
         split_seed=1,
         val_list=None,
     ):
-        image_dir = Path(root) / "Images"
-        label_dir = Path(root) / "Labels"
+        self.root = Path(root)
+        if split is None:
+            split = "train" if train is not False else "validation"
+        if split not in {"train", "validation", "test"}:
+            raise ValueError("split must be train, validation, or test")
+        self.split = split
+        self.transform = transform
+        self.dataset_name = self._read_dataset_name()
+
+        image_dir = self.root / "Images"
+        label_dir = self.root / "Labels"
         if not image_dir.is_dir() or not label_dir.is_dir():
             raise FileNotFoundError(
                 "dataset must contain Images/ and Labels/ under %s" % root
             )
-
         images = self._index_by_stem(image_dir)
         labels = self._index_by_stem(label_dir)
         missing_labels = sorted(set(images) - set(labels))
         missing_images = sorted(set(labels) - set(images))
         if missing_labels or missing_images:
             raise ValueError(
-                "image/label stems do not match; missing labels=%s, missing images=%s"
-                % (missing_labels[:5], missing_images[:5])
+                "image/label stems do not match under %s; missing labels=%s, "
+                "missing images=%s"
+                % (root, missing_labels[:5], missing_images[:5])
             )
+        if len(images) < 2:
+            raise ValueError("at least two paired samples are required under %s" % root)
 
-        pairs = [(images[stem], labels[stem]) for stem in sorted(images)]
-        if len(pairs) < 2:
-            raise ValueError("at least two paired samples are required")
-        if val_list:
-            with open(val_list, "r", encoding="utf-8") as file:
-                val_stems = {
-                    Path(line.strip()).stem for line in file if line.strip()
-                }
-            unknown = sorted(val_stems - set(images))
-            if unknown:
-                raise ValueError("validation list contains unknown stems: %s" % unknown[:5])
-            if not val_stems or len(val_stems) == len(pairs):
-                raise ValueError("validation list must select some, but not all, samples")
-            self.pairs = [
-                pair for pair in pairs
-                if ((pair[0].stem not in val_stems) if train else
-                    (pair[0].stem in val_stems))
-            ]
-        else:
-            if not 0.0 < val_ratio < 1.0:
-                raise ValueError("val_ratio must be between 0 and 1")
-            rng = random.Random(split_seed)
-            rng.shuffle(pairs)
-            val_count = max(1, min(len(pairs) - 1,
-                                   int(round(len(pairs) * val_ratio))))
-            self.pairs = pairs[val_count:] if train else pairs[:val_count]
+        group_variants = any(stem.startswith("dehw_train_") for stem in images)
+        selected = self._select_stems(
+            set(images), split, val_ratio, split_seed, val_list, group_variants
+        )
+        self.pairs = [(images[stem], labels[stem]) for stem in sorted(selected)]
+        if not self.pairs:
+            raise ValueError("%s split is empty for %s" % (split, root))
         self.images = [str(pair[0]) for pair in self.pairs]
         self.targets = [str(pair[1]) for pair in self.pairs]
-        self.transform = transform
-        split_name = "train" if train else "validation"
-        print("%s: %d paired samples" % (split_name, len(self.pairs)))
+        self.sample_ids = [pair[0].stem for pair in self.pairs]
+        print("%s/%s: %d paired samples" %
+              (self.dataset_name, self.split, len(self.pairs)))
+
+    def _read_dataset_name(self):
+        metadata_path = self.root / "dataset.json"
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if metadata.get("name"):
+                    return str(metadata["name"])
+            except (OSError, ValueError):
+                pass
+        return self.root.name
 
     @classmethod
     def _index_by_stem(cls, directory):
@@ -104,11 +117,80 @@ class HWSegmentation(data.Dataset):
             raise ValueError("no supported images found in %s" % directory)
         return result
 
+    @staticmethod
+    def _read_stem_list(path):
+        return {
+            Path(line.strip()).stem
+            for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+    @classmethod
+    def _group_key(cls, stem, group_variants):
+        if not group_variants:
+            return stem
+        match = cls.variant_suffix.match(stem)
+        return match.group("group") if match else stem
+
+    @classmethod
+    def _generated_validation_stems(
+        cls, all_stems, val_ratio, split_seed, group_variants=False
+    ):
+        if not 0.0 < val_ratio < 1.0:
+            raise ValueError("val_ratio must be between 0 and 1")
+        groups = {}
+        for stem in sorted(all_stems):
+            groups.setdefault(cls._group_key(stem, group_variants), []).append(stem)
+        if len(groups) < 2:
+            raise ValueError("at least two source groups are required for train/validation")
+        group_names = sorted(groups)
+        random.Random(split_seed).shuffle(group_names)
+        target = max(1, int(round(len(all_stems) * val_ratio)))
+        selected = set()
+        for group_name in group_names:
+            if selected and len(selected) >= target:
+                break
+            selected.update(groups[group_name])
+        if len(selected) == len(all_stems):
+            selected.difference_update(groups[group_names[-1]])
+        return selected
+
+    def _select_stems(
+        self, all_stems, split, val_ratio, split_seed, val_list, group_variants
+    ):
+        split_path = self.root / "splits" / (split + ".txt")
+        if split_path.is_file():
+            selected = self._read_stem_list(split_path)
+        elif val_list:
+            validation = self._read_stem_list(val_list)
+            if split == "validation":
+                selected = validation
+            elif split == "train":
+                selected = all_stems - validation
+            else:
+                raise ValueError("test split needs splits/test.txt")
+        elif split in {"train", "validation"}:
+            validation = self._generated_validation_stems(
+                all_stems, val_ratio, split_seed, group_variants
+            )
+            selected = all_stems - validation if split == "train" else validation
+        else:
+            raise ValueError("test split needs %s" % split_path)
+
+        unknown = sorted(selected - all_stems)
+        if unknown:
+            raise ValueError("%s contains unknown stems: %s" %
+                             (split_path if split_path.is_file() else split, unknown[:5]))
+        return selected
+
     @classmethod
     def encode_target(cls, target):
         target = np.asarray(target, dtype=np.int64)
-        if target.size and target.max() >= len(cls.id_to_train_id):
-            raise ValueError("label contains an unsupported class id: %d" % target.max())
+        if target.size and (target.min() < 0 or target.max() >= len(cls.id_to_train_id)):
+            raise ValueError(
+                "label contains unsupported class ids: min=%d max=%d"
+                % (target.min(), target.max())
+            )
         return cls.id_to_train_id[target]
 
     @classmethod
@@ -117,8 +199,10 @@ class HWSegmentation(data.Dataset):
 
     def __getitem__(self, index):
         image_path, target_path = self.pairs[index]
-        image = Image.open(image_path).convert("RGB")
-        target = Image.open(target_path).convert("L")
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+        with Image.open(target_path) as source:
+            target = source.convert("L")
         if image.size != target.size:
             raise ValueError(
                 "image and label sizes differ for %s: %s vs %s"
@@ -130,3 +214,28 @@ class HWSegmentation(data.Dataset):
 
     def __len__(self):
         return len(self.pairs)
+
+
+class MultiSourceHWSegmentation(data.ConcatDataset):
+    """Concatenation with optional equal-probability domain sampling weights."""
+
+    def __init__(self, datasets):
+        if not datasets:
+            raise ValueError("at least one dataset source is required")
+        super().__init__(datasets)
+        self.dataset_names = [
+            getattr(dataset, "dataset_name", "source_%d" % index)
+            for index, dataset in enumerate(datasets)
+        ]
+
+    def balanced_sample_weights(self, dataset_weights=None):
+        if dataset_weights is None:
+            dataset_weights = [1.0] * len(self.datasets)
+        if len(dataset_weights) != len(self.datasets):
+            raise ValueError("dataset weight count must match data-root count")
+        if any(weight <= 0 for weight in dataset_weights):
+            raise ValueError("dataset weights must be positive")
+        sample_weights = []
+        for dataset, source_weight in zip(self.datasets, dataset_weights):
+            sample_weights.extend([source_weight / len(dataset)] * len(dataset))
+        return sample_weights

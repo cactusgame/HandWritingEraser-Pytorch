@@ -1,1 +1,1 @@
-from .handwriting import HWSegmentation
+from .handwriting import HWSegmentation, MultiSourceHWSegmentation

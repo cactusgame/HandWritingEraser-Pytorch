@@ -400,6 +400,28 @@ class ExtRandomCrop(object):
         return self.__class__.__name__ + '(size={0}, padding={1})'.format(self.size, self.padding)
 
 
+class ExtEnsureMinSize(object):
+    """Upscale while preserving aspect ratio so a crop is not mostly padding."""
+
+    def __init__(self, size):
+        if isinstance(size, numbers.Number):
+            self.size = (int(size), int(size))
+        else:
+            self.size = tuple(size)
+
+    def __call__(self, img, lbl):
+        assert img.size == lbl.size
+        width, height = img.size
+        scale = max(self.size[0] / float(height), self.size[1] / float(width), 1.0)
+        if scale == 1.0:
+            return img, lbl
+        target = (int(round(height * scale)), int(round(width * scale)))
+        return F.resize(img, target, Image.BILINEAR), F.resize(lbl, target, Image.NEAREST)
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(size={0})'.format(self.size)
+
+
 class ExtForegroundRandomCrop(ExtRandomCrop):
     """Prefer crops containing enough pixels from selected rare classes."""
 

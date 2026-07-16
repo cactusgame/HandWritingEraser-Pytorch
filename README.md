@@ -75,16 +75,45 @@ datasets/data/
 
 图像与标签扩展名可以不同，但文件 stem 必须一一对应。标签必须是单通道类别 ID：背景 0、手写 1、印刷 2。
 
+### 转换新增数据集
+
+两个转换器都生成相同的标准结构：`Images/`、`Labels/`、`splits/` 和 `dataset.json`。默认输出不会修改原始数据，也不会静默覆盖已有结果。
+
+```bash
+python tools/convert_scut_ensexam.py
+python tools/convert_signatr6k.py
+```
+
+转换被中断时可追加 `--resume`，已经完成且标签合法的样本会直接复用；需要从头重建时使用 `--overwrite`，两者不能同时使用。
+
+默认输出目录：
+
+- `/Users/peng/Documents/data/HandWritingData/SCUT-EnsExam-baidu-format`
+- `/Users/peng/Documents/data/HandWritingData/SignaTR6K-baidu-format`
+
+SCUT-EnsExam 的原图和擦除图是对齐图像，转换器在手写四边形内进行成对差分，学生答案和教师批改都映射为手写类；印刷类从擦除图的局部对比度和暗像素提取。相关阈值都可通过 `python tools/convert_scut_ensexam.py --help` 调整。官方 430 张训练页会固定拆出 15% 作为验证集，115 张官方测试页不会进入训练或验证。
+
+SignaTR6K 的颜色映射为：蓝→背景，绿→手写，红→印刷。黄色表示手写与印刷重叠；为了与 Baidu 的互斥三类标签兼容并保证擦除召回率，默认映射为手写。官方 train/validation/test split 原样保留。
+
 ## 训练
+
+三个数据集一起训练：
 
 ```bash
 python main.py \
-  --data-root datasets/data \
+  --data-root /Users/peng/Documents/data/HandWritingData/baidu \
+  --data-root /Users/peng/Documents/data/HandWritingData/SCUT-EnsExam-baidu-format \
+  --data-root /Users/peng/Documents/data/HandWritingData/SignaTR6K-baidu-format \
   --model lite_eraser \
+  --dataset-sampling balanced \
   --batch-size 8 \
-  --crop-size 768 \
+  --crop-size 512 \
   --total-itrs 30000
 ```
+
+`--data-root` 可以重复任意次数。默认 `balanced` 让每个数据集获得相同的抽样概率，避免样本最多的 SignaTR6K 主导训练；`--dataset-sampling proportional` 恢复按样本数混合，`--dataset-weights 2,1,1` 可自定义三个数据源的相对概率。验证时会分别打印每个数据集及总集合的指标，最佳模型按各数据集 `Handwriting IoU` 的宏平均保存，避免高分辨率 SCUT 页面仅凭像素数主导模型选择。
+
+小尺寸 SignaTR6K 图像会先保持比例放大到训练 crop 的最小尺寸，不会在 768/512 crop 周围填充大面积空白。
 
 如果同一原始试卷生成了多个增强样本，建议把同源样本放在同一个 split，避免验证泄漏。可在文本文件中逐行写验证集文件 stem，并传入 `--val-list validation.txt`。
 

@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 import network
 import utils
-from datasets import HWSegmentation
+from datasets import HWSegmentation, MultiSourceHWSegmentation
 from metrics import StreamSegMetrics
 from utils import ext_transforms as et
 
@@ -24,7 +24,10 @@ STD = [0.229, 0.224, 0.225]
 
 def get_argparser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", "--data_root", default="./datasets/data")
+    parser.add_argument(
+        "--data-root", "--data_root", dest="data_roots", action="append",
+        help="Baidu-format dataset root; repeat this option for multiple sources",
+    )
     available_models = sorted(
         name
         for name, value in network.modeling.__dict__.items()
@@ -56,7 +59,16 @@ def get_argparser():
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--val-list", default=None,
-                        help="optional file containing validation image stems")
+                        help="validation stems for a single legacy data root")
+    parser.add_argument(
+        "--dataset-sampling", choices=["balanced", "proportional"],
+        default="balanced",
+        help="equalize dataset domains or sample in proportion to their sizes",
+    )
+    parser.add_argument(
+        "--dataset-weights", default=None,
+        help="optional comma-separated source weights in --data-root order",
+    )
     parser.add_argument("--random-seed", "--random_seed", type=int, default=1)
     parser.add_argument("--print-interval", type=int, default=20)
     parser.add_argument("--val-interval", "--val_interval", type=int, default=500)
@@ -103,10 +115,20 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def get_dataset(opts):
+def parse_dataset_weights(value, count):
+    if value is None:
+        return None
+    weights = [float(item.strip()) for item in value.split(",")]
+    if len(weights) != count or any(weight <= 0 for weight in weights):
+        raise ValueError("--dataset-weights needs %d positive values" % count)
+    return weights
+
+
+def get_datasets(opts):
     train_transform = et.ExtCompose([
         et.ExtColorJitter(brightness=0.25, contrast=0.25, saturation=0.15),
         et.ExtRandomScale((0.75, 1.5)),
+        et.ExtEnsureMinSize(opts.crop_size),
         et.ExtForegroundRandomCrop(
             opts.crop_size, target_classes=(1,), min_foreground_ratio=0.001
         ),
@@ -117,16 +139,32 @@ def get_dataset(opts):
         et.ExtToTensor(),
         et.ExtNormalize(MEAN, STD),
     ])
-    common = dict(
-        root=opts.data_root,
-        val_ratio=opts.val_ratio,
-        split_seed=opts.random_seed,
-        val_list=opts.val_list,
-    )
-    return (
-        HWSegmentation(transform=train_transform, train=True, **common),
-        HWSegmentation(transform=eval_transform, train=False, **common),
-    )
+    roots = opts.data_roots or ["./datasets/data"]
+    if opts.val_list and len(roots) != 1:
+        raise ValueError("--val-list is only valid with one --data-root")
+    train_sources = []
+    validation_sources = []
+    used_names = {}
+    for root in roots:
+        common = dict(
+            root=root,
+            val_ratio=opts.val_ratio,
+            split_seed=opts.random_seed,
+            val_list=opts.val_list,
+        )
+        train_dataset = HWSegmentation(
+            transform=train_transform, split="train", **common
+        )
+        validation_dataset = HWSegmentation(
+            transform=eval_transform, split="validation", **common
+        )
+        name = validation_dataset.dataset_name
+        used_names[name] = used_names.get(name, 0) + 1
+        if used_names[name] > 1:
+            name = "%s#%d" % (name, used_names[name])
+        train_sources.append(train_dataset)
+        validation_sources.append((name, validation_dataset))
+    return MultiSourceHWSegmentation(train_sources), validation_sources
 
 
 def build_model(opts, pretrained_backbone):
@@ -200,14 +238,36 @@ def predict_page(model, image, device, tile_size, overlap):
 
 
 @torch.no_grad()
-def validate(model, loader, device, metrics, tile_size, overlap):
+def validate_sources(model, loaders, device, metrics, tile_size, overlap):
     model.eval()
     metrics.reset()
-    for images, labels in tqdm(loader, desc="validation", leave=False):
-        logits = predict_page(model, images, device, tile_size, overlap)
-        predictions = logits.argmax(1).cpu().numpy()
-        metrics.update(labels.numpy(), predictions)
-    return metrics.get_results()
+    source_scores = {}
+    for source_name, loader in loaders:
+        source_metrics = StreamSegMetrics(metrics.n_classes)
+        for images, labels in tqdm(
+            loader, desc="validation/%s" % source_name, leave=False
+        ):
+            logits = predict_page(model, images, device, tile_size, overlap)
+            predictions = logits.argmax(1).cpu().numpy()
+            targets = labels.numpy()
+            source_metrics.update(targets, predictions)
+            metrics.update(targets, predictions)
+        source_scores[source_name] = source_metrics.get_results()
+    return metrics.get_results(), source_scores
+
+
+def print_validation_scores(overall_score, source_scores, metrics):
+    for source_name, score in source_scores.items():
+        print("\n[validation/%s]%s" % (source_name, metrics.to_str(score)))
+    print("\n[validation/all]%s" % metrics.to_str(overall_score))
+
+
+def validation_selection_score(source_scores):
+    """Macro-average domains so high-resolution SCUT pages do not dominate."""
+    values = [score["Handwriting IoU"] for score in source_scores.values()]
+    value = float(np.nanmean(values))
+    print("validation macro Handwriting IoU: %.6f" % value)
+    return value
 
 
 def save_checkpoint(path, model, optimizer, scheduler, opts, iteration, best_score):
@@ -219,12 +279,18 @@ def save_checkpoint(path, model, optimizer, scheduler, opts, iteration, best_sco
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "best_score": best_score,
+        "best_score_name": "validation macro Handwriting IoU",
         "model_config": {
             "model": opts.model,
             "num_classes": opts.num_classes,
             "output_stride": opts.output_stride,
             "mean": MEAN,
             "std": STD,
+        },
+        "data_config": {
+            "roots": list(opts.data_roots or ["./datasets/data"]),
+            "sampling": opts.dataset_sampling,
+            "dataset_weights": opts.dataset_weights,
         },
     }
     torch.save(state, path)
@@ -238,12 +304,26 @@ def main():
     seed_everything(opts.random_seed)
     print("device: %s" % device)
 
-    train_dataset, val_dataset = get_dataset(opts)
+    train_dataset, validation_datasets = get_datasets(opts)
     generator = torch.Generator().manual_seed(opts.random_seed)
+    sampler = None
+    dataset_weights = parse_dataset_weights(
+        opts.dataset_weights, len(train_dataset.datasets)
+    )
+    if dataset_weights is not None and opts.dataset_sampling != "balanced":
+        raise ValueError("--dataset-weights requires --dataset-sampling balanced")
+    if opts.dataset_sampling == "balanced" and len(train_dataset.datasets) > 1:
+        sampler = data.WeightedRandomSampler(
+            train_dataset.balanced_sample_weights(dataset_weights),
+            num_samples=len(train_dataset),
+            replacement=True,
+            generator=generator,
+        )
     train_loader = data.DataLoader(
         train_dataset,
         batch_size=opts.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=opts.workers,
         pin_memory=device.type == "cuda",
         drop_last=len(train_dataset) >= opts.batch_size,
@@ -251,13 +331,23 @@ def main():
         generator=generator,
     )
     # Full-resolution pages can have different shapes, so validation uses batch 1.
-    val_loader = data.DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=opts.workers,
-        pin_memory=device.type == "cuda",
-    )
+    validation_loaders = [
+        (
+            name,
+            data.DataLoader(
+                dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=opts.workers,
+                pin_memory=device.type == "cuda",
+            ),
+        )
+        for name, dataset in validation_datasets
+    ]
+    print("training sources: %s; sampling: %s" %
+          (dict(zip(train_dataset.dataset_names,
+                    [len(dataset) for dataset in train_dataset.datasets])),
+           opts.dataset_sampling))
 
     model = build_model(opts, opts.pretrained_backbone and opts.ckpt is None)
     model.to(device)
@@ -289,11 +379,11 @@ def main():
         print("loaded: %s" % opts.ckpt)
 
     if opts.test_only:
-        score = validate(
-            model, val_loader, device, metrics,
+        score, source_scores = validate_sources(
+            model, validation_loaders, device, metrics,
             opts.val_tile_size, opts.val_overlap,
         )
-        print(metrics.to_str(score))
+        print_validation_scores(score, source_scores, metrics)
         return
 
     checkpoint_dir = Path(opts.checkpoint_dir)
@@ -331,12 +421,12 @@ def main():
                 running_loss = 0.0
 
             if iteration % opts.val_interval == 0 or iteration == opts.total_itrs:
-                score = validate(
-                    model, val_loader, device, metrics,
+                score, source_scores = validate_sources(
+                    model, validation_loaders, device, metrics,
                     opts.val_tile_size, opts.val_overlap,
                 )
-                print(metrics.to_str(score))
-                handwriting_iou = score["Handwriting IoU"]
+                print_validation_scores(score, source_scores, metrics)
+                handwriting_iou = validation_selection_score(source_scores)
                 improved = (
                     not np.isnan(handwriting_iou) and handwriting_iou > best_score
                 )
