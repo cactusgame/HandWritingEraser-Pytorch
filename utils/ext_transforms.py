@@ -400,6 +400,39 @@ class ExtRandomCrop(object):
         return self.__class__.__name__ + '(size={0}, padding={1})'.format(self.size, self.padding)
 
 
+class ExtForegroundRandomCrop(ExtRandomCrop):
+    """Prefer crops containing enough pixels from selected rare classes."""
+
+    def __init__(self, size, target_classes=(1,), min_foreground_ratio=0.001,
+                 attempts=10):
+        super().__init__(size, pad_if_needed=True)
+        self.target_classes = tuple(target_classes)
+        self.min_foreground_ratio = min_foreground_ratio
+        self.attempts = attempts
+
+    def __call__(self, img, lbl):
+        assert img.size == lbl.size
+        pad_w = max(0, self.size[1] - img.size[0])
+        pad_h = max(0, self.size[0] - img.size[1])
+        if pad_w or pad_h:
+            padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
+            img = F.pad(img, padding, fill=255)
+            lbl = F.pad(lbl, padding, fill=0)
+
+        selected = self.get_params(img, self.size)
+        for _ in range(self.attempts):
+            candidate = self.get_params(img, self.size)
+            i, j, h, w = candidate
+            crop_lbl = F.crop(lbl, i, j, h, w)
+            target_pixels = np.isin(np.asarray(crop_lbl), self.target_classes)
+            foreground_ratio = np.count_nonzero(target_pixels) / float(h * w)
+            selected = candidate
+            if foreground_ratio >= self.min_foreground_ratio:
+                break
+        i, j, h, w = selected
+        return F.crop(img, i, j, h, w), F.crop(lbl, i, j, h, w)
+
+
 class ExtResize(object):
     """Resize the input PIL Image to the given size.
     Args:
@@ -571,4 +604,3 @@ class Compose(object):
             format_string += '    {0}'.format(t)
         format_string += '\n)'
         return format_string
-

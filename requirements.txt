@@ -1,8 +1,5 @@
-torch
-torchvision
-numpy
-pillow
-scikit-learn
-tqdm
-matplotlib
-visdom
+torch>=2.1
+torchvision>=0.16
+numpy>=1.23
+pillow>=9.5
+tqdm>=4.65

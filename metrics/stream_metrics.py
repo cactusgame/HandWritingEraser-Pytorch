@@ -1,5 +1,4 @@
 import numpy as np
-from sklearn.metrics import confusion_matrix
 
 
 class _StreamMetrics(object):
@@ -65,20 +64,40 @@ class StreamSegMetrics(_StreamMetrics):
             - fwavacc
         """
         hist = self.confusion_matrix
-        acc = np.diag(hist).sum() / hist.sum()
-        acc_cls = np.diag(hist) / hist.sum(axis=1)
+        total = hist.sum()
+        acc = np.diag(hist).sum() / total if total else 0.0
+        acc_cls = np.divide(
+            np.diag(hist), hist.sum(axis=1),
+            out=np.full(self.n_classes, np.nan), where=hist.sum(axis=1) != 0)
         acc_cls = np.nanmean(acc_cls)
-        iu = np.diag(hist) / (hist.sum(axis=1) + hist.sum(axis=0) - np.diag(hist))
+        union = hist.sum(axis=1) + hist.sum(axis=0) - np.diag(hist)
+        iu = np.divide(np.diag(hist), union,
+                       out=np.full(self.n_classes, np.nan), where=union != 0)
         mean_iu = np.nanmean(iu)
-        freq = hist.sum(axis=1) / hist.sum()
+        freq = hist.sum(axis=1) / total if total else np.zeros(self.n_classes)
         fwavacc = (freq[freq > 0] * iu[freq > 0]).sum()
         cls_iu = dict(zip(range(self.n_classes), iu))
+        if self.n_classes > 1:
+            hand_tp = hist[1, 1]
+            hand_precision_den = hist[:, 1].sum()
+            hand_recall_den = hist[1, :].sum()
+            hand_precision = hand_tp / hand_precision_den if hand_precision_den else 0.0
+            hand_recall = hand_tp / hand_recall_den if hand_recall_den else 0.0
+            pr_sum = hand_precision + hand_recall
+            hand_f1 = (2 * hand_precision * hand_recall / pr_sum) if pr_sum else 0.0
+        else:
+            hand_precision = hand_recall = hand_f1 = 0.0
 
         return {
             "Overall Acc": acc,
             "Mean Acc": acc_cls,
             "FreqW Acc": fwavacc,
             "Mean IoU": mean_iu,
+            "Foreground Mean IoU": np.nanmean(iu[1:]) if self.n_classes > 1 else mean_iu,
+            "Handwriting IoU": iu[1] if self.n_classes > 1 else mean_iu,
+            "Handwriting Precision": hand_precision,
+            "Handwriting Recall": hand_recall,
+            "Handwriting F1": hand_f1,
             "Class IoU": cls_iu,
         }
 

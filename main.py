@@ -1,347 +1,358 @@
-from tqdm import tqdm
-import network
-import utils
+"""Training entry point for handwriting/print/background segmentation."""
+
+import argparse
 import os
 import random
-import argparse
+from pathlib import Path
+
 import numpy as np
-
-from torch.utils import data
-from utils import ext_transforms as et
-from metrics import StreamSegMetrics
-
 import torch
-import torch.nn as nn
-# from utils.visualizer import Visualizer
+from torch import nn
+from torch.utils import data
+from tqdm import tqdm
 
-from PIL import Image
-import matplotlib
-import matplotlib.pyplot as plt
-import torchvision.transforms.functional as F
-from torchvision import transforms
+import network
+import utils
 from datasets import HWSegmentation
+from metrics import StreamSegMetrics
+from utils import ext_transforms as et
 
+
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
 
 
 def get_argparser():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", "--data_root", default="./datasets/data")
+    available_models = sorted(
+        name
+        for name, value in network.modeling.__dict__.items()
+        if name.islower()
+        and not name.startswith("_")
+        and callable(value)
+        and (name.startswith("deeplab") or name == "lite_eraser")
+    )
+    parser.add_argument("--model", default="lite_eraser", choices=available_models)
+    parser.add_argument("--output-stride", "--output_stride", type=int, default=16, choices=[8, 16])
+    parser.add_argument("--num-classes", type=int, default=3, choices=[3])
+    parser.add_argument("--pretrained-backbone", dest="pretrained_backbone", action="store_true")
+    parser.add_argument("--no-pretrained-backbone", dest="pretrained_backbone", action="store_false")
+    parser.set_defaults(pretrained_backbone=True)
 
-    # Datset Options
-    parser.add_argument("--data_root", type=str, default='./datasets/data',
-                        help="path to Dataset")
+    parser.add_argument("--total-itrs", "--total_itrs", type=int, default=30000)
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=8)
+    parser.add_argument("--crop-size", "--crop_size", type=int, default=768)
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--backbone-lr-mult", type=float, default=0.25)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--warmup-itrs", type=int, default=500)
+    parser.add_argument("--loss", "--loss_type", default="hybrid",
+                        choices=["hybrid", "focal", "cross_entropy"])
+    parser.add_argument("--class-weights", default="1,4,2",
+                        help="background,handwriting,print weights")
+    parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--val-list", default=None,
+                        help="optional file containing validation image stems")
+    parser.add_argument("--random-seed", "--random_seed", type=int, default=1)
+    parser.add_argument("--print-interval", type=int, default=20)
+    parser.add_argument("--val-interval", "--val_interval", type=int, default=500)
+    parser.add_argument("--val-tile-size", type=int, default=1024)
+    parser.add_argument("--val-overlap", type=int, default=128)
 
-    # Deeplab Options
-    available_models = sorted(name for name in network.modeling.__dict__ if name.islower() and \
-                              not (name.startswith("__") or name.startswith('_')) and callable(
-        network.modeling.__dict__[name])
-                              )
-    parser.add_argument("--model", type=str, default='deeplabv3plus_resnet101',
-                        choices=available_models, help='model name')
-    parser.add_argument("--separable_conv", action='store_true', default=False,
-                        help="apply separable conv to decoder and aspp")
-    parser.add_argument("--output_stride", type=int, default=16, choices=[8, 16])
-
-    # Train Options
-    parser.add_argument("--test_only", action='store_true', default=False)
-    parser.add_argument("--save_val_results", action='store_true', default=False,
-                        help="save segmentation results to \"./results\"")
-    parser.add_argument("--total_itrs", type=int, default=30e3,
-                        help="epoch number (default: 30k)")
-    parser.add_argument("--lr", type=float, default=0.01,
-                        help="learning rate (default: 0.01)")
-    parser.add_argument("--lr_policy", type=str, default='poly', choices=['poly', 'step'],
-                        help="learning rate scheduler policy")
-    parser.add_argument("--step_size", type=int, default=10000)
-    parser.add_argument("--crop_val", action='store_true', default=False,
-                        help='crop validation (default: False)')
-    parser.add_argument("--batch_size", type=int, default=4,
-                        help='batch size (default: 16)')
-    parser.add_argument("--val_batch_size", type=int, default=4,
-                        help='batch size for validation (default: 4)')
-    parser.add_argument("--crop_size", type=int, default=513)
-
-    parser.add_argument("--ckpt", default=None, type=str,
-                        help="restore from checkpoint")
-    parser.add_argument("--continue_training", action='store_true', default=False)
-
-    parser.add_argument("--loss_type", type=str, default='cross_entropy',
-                        choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
-    parser.add_argument("--gpu_id", type=str, default='0',
-                        help="GPU ID")
-    parser.add_argument("--weight_decay", type=float, default=1e-4,
-                        help='weight decay (default: 1e-4)')
-    parser.add_argument("--random_seed", type=int, default=1,
-                        help="random seed (default: 1)")
-    parser.add_argument("--print_interval", type=int, default=10,
-                        help="print interval of loss (default: 10)")
-    parser.add_argument("--val_interval", type=int, default=100,
-                        help="epoch interval for eval (default: 100)")
-    parser.add_argument("--download", action='store_true', default=False,
-                        help="download datasets")
-
-    # Visdom options
-    parser.add_argument("--enable_vis", action='store_true', default=True,
-                        help="use visdom for visualization")
-    parser.add_argument("--vis_port", type=str, default='8097',
-                        help='port for visdom')
-    parser.add_argument("--vis_env", type=str, default='main',
-                        help='env for visdom')
-    parser.add_argument("--vis_num_samples", type=int, default=8,
-                        help='number of samples for visualization (default: 8)')
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--gpu-id", "--gpu_id", default="0")
+    parser.add_argument("--ckpt", default=None)
+    parser.add_argument("--continue-training", "--continue_training", action="store_true")
+    parser.add_argument("--test-only", "--test_only", action="store_true")
+    parser.add_argument("--checkpoint-dir", default="checkpoints")
     return parser
 
 
+def parse_class_weights(value, num_classes):
+    weights = [float(item.strip()) for item in value.split(",")]
+    if len(weights) != num_classes or any(weight <= 0 for weight in weights):
+        raise ValueError("--class-weights needs %d positive values" % num_classes)
+    return weights
+
+
+def resolve_device(name):
+    if name == "cpu":
+        return torch.device("cpu")
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    if name == "cuda" or (name == "auto" and torch.cuda.is_available()):
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def get_dataset(opts):
-    """ Dataset And Augmentation
-    """
-    train_transform = et.ExtCompose(
-        [
-            et.ExtResize([1024, 1024]),
-            et.ExtToTensor(),
-            et.ExtColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
-            et.ExtNormalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ]
-    )
-    eval_transforms = et.ExtCompose([
-        et.ExtResize([1024, 1024]),
+    train_transform = et.ExtCompose([
+        et.ExtColorJitter(brightness=0.25, contrast=0.25, saturation=0.15),
+        et.ExtRandomScale((0.75, 1.5)),
+        et.ExtForegroundRandomCrop(
+            opts.crop_size, target_classes=(1,), min_foreground_ratio=0.001
+        ),
         et.ExtToTensor(),
-        et.ExtNormalize(
-            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        et.ExtNormalize(MEAN, STD),
     ])
-    train_dst = HWSegmentation(root=opts.data_root, transform=train_transform, train=True)
-    val_dst = HWSegmentation(root=opts.data_root, transform=eval_transforms, train=False)
-    return train_dst, val_dst
+    eval_transform = et.ExtCompose([
+        et.ExtToTensor(),
+        et.ExtNormalize(MEAN, STD),
+    ])
+    common = dict(
+        root=opts.data_root,
+        val_ratio=opts.val_ratio,
+        split_seed=opts.random_seed,
+        val_list=opts.val_list,
+    )
+    return (
+        HWSegmentation(transform=train_transform, train=True, **common),
+        HWSegmentation(transform=eval_transform, train=False, **common),
+    )
 
 
-def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
-    """Do validation and return specified samples"""
+def build_model(opts, pretrained_backbone):
+    return network.modeling.__dict__[opts.model](
+        num_classes=opts.num_classes,
+        output_stride=opts.output_stride,
+        pretrained_backbone=pretrained_backbone,
+    )
+
+
+def parameter_groups(model, lr, backbone_lr_mult):
+    backbone, decoder = [], []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith(("low_level", "high_level", "backbone")):
+            backbone.append(parameter)
+        else:
+            decoder.append(parameter)
+    groups = []
+    if backbone:
+        groups.append({"params": backbone, "lr": lr * backbone_lr_mult})
+    if decoder:
+        groups.append({"params": decoder, "lr": lr})
+    return groups
+
+
+def tile_starts(length, tile_size, overlap):
+    if length <= tile_size:
+        return [0]
+    step = tile_size - overlap
+    starts = list(range(0, length - tile_size + 1, step))
+    if starts[-1] != length - tile_size:
+        starts.append(length - tile_size)
+    return starts
+
+
+@torch.no_grad()
+def predict_page(model, image, device, tile_size, overlap):
+    """Return CPU logits while keeping full-resolution activations off the GPU."""
+    if tile_size <= 0 or overlap < 0 or overlap >= tile_size:
+        raise ValueError("validation needs 0 <= overlap < tile-size")
+    height, width = image.shape[-2:]
+    if height <= tile_size and width <= tile_size:
+        return model(image.to(device, dtype=torch.float32)).cpu()
+
+    ys = tile_starts(height, tile_size, overlap)
+    xs = tile_starts(width, tile_size, overlap)
+    logits_sum = None
+    weight_sum = torch.zeros((height, width), dtype=torch.float32)
+    window_cache = {}
+    for y in ys:
+        for x in xs:
+            crop = image[..., y:min(y + tile_size, height),
+                         x:min(x + tile_size, width)]
+            logits = model(crop.to(device, dtype=torch.float32)).float().cpu()
+            crop_h, crop_w = logits.shape[-2:]
+            if logits_sum is None:
+                logits_sum = torch.zeros(
+                    (1, logits.shape[1], height, width), dtype=torch.float32
+                )
+            key = (crop_h, crop_w)
+            if key not in window_cache:
+                wy = torch.hann_window(crop_h, periodic=False)
+                wx = torch.hann_window(crop_w, periodic=False)
+                window_cache[key] = torch.outer(wy, wx).clamp_min_(0.05)
+            weight = window_cache[key]
+            logits_sum[..., y:y + crop_h, x:x + crop_w] += logits * weight
+            weight_sum[y:y + crop_h, x:x + crop_w] += weight
+    return logits_sum / weight_sum.clamp_min_(1e-6)
+
+
+@torch.no_grad()
+def validate(model, loader, device, metrics, tile_size, overlap):
+    model.eval()
     metrics.reset()
-    ret_samples = []
-    if opts.save_val_results:
-        if not os.path.exists('results'):
-            os.mkdir('results')
-        denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406],
-                                   std=[0.229, 0.224, 0.225])
-        img_id = 0
-
-    with torch.no_grad():
-        for i, (images, labels) in tqdm(enumerate(loader)):
-            images = images.to(device, dtype=torch.float32)
-            labels = labels.to(device, dtype=torch.long)
-
-            outputs = model(images)
-            preds = outputs.detach().max(dim=1)[1].cpu().numpy()
-            targets = labels.cpu().numpy()
-
-            metrics.update(targets, preds)
-            if ret_samples_ids is not None and i in ret_samples_ids:  # get vis samples
-                ret_samples.append(
-                    (images[0].detach().cpu().numpy(), targets[0], preds[0]))
-
-            if opts.save_val_results:
-                for i in range(len(images)):
-                    image = images[i].detach().cpu().numpy()
-                    target = targets[i]
-                    pred = preds[i]
-
-                    image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
-                    target = loader.dataset.decode_target(target).astype(np.uint8)
-                    pred = loader.dataset.decode_target(pred).astype(np.uint8)
-
-                    Image.fromarray(image).save('results/%d_image.png' % img_id)
-                    Image.fromarray(target).save('results/%d_target.png' % img_id)
-                    Image.fromarray(pred).save('results/%d_pred.png' % img_id)
-
-                    fig = plt.figure()
-                    plt.imshow(image)
-                    plt.axis('off')
-                    plt.imshow(pred, alpha=0.7)
-                    ax = plt.gca()
-                    ax.xaxis.set_major_locator(matplotlib.ticker.NullLocator())
-                    ax.yaxis.set_major_locator(matplotlib.ticker.NullLocator())
-                    plt.savefig('results/%d_overlay.png' % img_id, bbox_inches='tight', pad_inches=0)
-                    plt.close()
-                    img_id += 1
-
-        score = metrics.get_results()
-    return score, ret_samples
+    for images, labels in tqdm(loader, desc="validation", leave=False):
+        logits = predict_page(model, images, device, tile_size, overlap)
+        predictions = logits.argmax(1).cpu().numpy()
+        metrics.update(labels.numpy(), predictions)
+    return metrics.get_results()
 
 
+def save_checkpoint(path, model, optimizer, scheduler, opts, iteration, best_score):
+    state = {
+        "format_version": 2,
+        "iteration": iteration,
+        "cur_itrs": iteration,
+        "model_state": utils.unwrap_model(model).state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "best_score": best_score,
+        "model_config": {
+            "model": opts.model,
+            "num_classes": opts.num_classes,
+            "output_stride": opts.output_stride,
+            "mean": MEAN,
+            "std": STD,
+        },
+    }
+    torch.save(state, path)
+    print("saved: %s" % path)
 
-def visual_test_result(test_path, save_path):
-    pass
 
 def main():
     opts = get_argparser().parse_args()
-    opts.num_classes = 3
+    os.environ["CUDA_VISIBLE_DEVICES"] = opts.gpu_id
+    device = resolve_device(opts.device)
+    seed_everything(opts.random_seed)
+    print("device: %s" % device)
 
-    # Setup visualization
-    # vis = Visualizer(port=opts.vis_port,
-    #                  env=opts.vis_env) if opts.enable_vis else None
-    # if vis is not None:  # display options
-    #     vis.vis_table("Options", vars(opts))
-
-    os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("Device: %s" % device)
-
-    # Setup random seed
-    torch.manual_seed(opts.random_seed)
-    np.random.seed(opts.random_seed)
-    random.seed(opts.random_seed)
-
-    # Setup dataloader
-    train_dst, val_dst = get_dataset(opts)
+    train_dataset, val_dataset = get_dataset(opts)
+    generator = torch.Generator().manual_seed(opts.random_seed)
     train_loader = data.DataLoader(
-        train_dst,
+        train_dataset,
         batch_size=opts.batch_size,
         shuffle=True,
-        num_workers=2,
-        drop_last=True
+        num_workers=opts.workers,
+        pin_memory=device.type == "cuda",
+        drop_last=len(train_dataset) >= opts.batch_size,
+        worker_init_fn=seed_worker,
+        generator=generator,
     )
-
+    # Full-resolution pages can have different shapes, so validation uses batch 1.
     val_loader = data.DataLoader(
-        val_dst,
-        batch_size=opts.val_batch_size,
-        shuffle=True,
-        num_workers=2
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=opts.workers,
+        pin_memory=device.type == "cuda",
     )
 
-    model = network.modeling.deeplabv3plus_resnet101(num_classes=opts.num_classes, output_stride=opts.output_stride)
-    if opts.separable_conv and 'plus' in opts.model:
-        network.convert_to_separable_conv(model.classifier)
-    utils.set_bn_momentum(model.backbone, momentum=0.01)
+    model = build_model(opts, opts.pretrained_backbone and opts.ckpt is None)
+    model.to(device)
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
 
-    # Set up metrics
+    optimizer = torch.optim.AdamW(
+        parameter_groups(utils.unwrap_model(model), opts.lr, opts.backbone_lr_mult),
+        lr=opts.lr,
+        weight_decay=opts.weight_decay,
+    )
+    scheduler = utils.WarmupPolyLR(
+        optimizer, opts.total_itrs, opts.warmup_itrs, power=0.9
+    )
+    class_weights = parse_class_weights(opts.class_weights, opts.num_classes)
+    criterion = utils.build_loss(
+        opts.loss, class_weights, opts.dice_weight
+    ).to(device)
     metrics = StreamSegMetrics(opts.num_classes)
 
-    # Set up optimizer
-    optimizer = torch.optim.SGD(params=[
-        {'params': model.backbone.parameters(), 'lr': 0.1 * opts.lr},
-        {'params': model.classifier.parameters(), 'lr': opts.lr},
-    ], lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
-    # optimizer = torch.optim.SGD(params=model.parameters(), lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
-    # torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.lr_decay_step, gamma=opts.lr_decay_factor)
-    if opts.lr_policy == 'poly':
-        scheduler = utils.PolyLR(optimizer, opts.total_itrs, power=0.9)
-    elif opts.lr_policy == 'step':
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
-
-    # Set up criterion
-    # criterion = utils.get_loss(opts.loss_type)
-    if opts.loss_type == 'focal_loss':
-        criterion = utils.FocalLoss(size_average=True)
-    elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(reduction='mean')
-
-    def save_ckpt(path):
-        """ save current model
-        """
-        torch.save({
-            "cur_itrs": cur_itrs,
-            "model_state": model.module.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
-            "best_score": best_score,
-        }, path)
-        print("Model saved as %s" % path)
-
-    utils.mkdir('checkpoints')
-    # Restore
-    best_score = 0.0
-    cur_itrs = 0
-    cur_epochs = 0
-    if opts.ckpt is not None and os.path.isfile(opts.ckpt):
-        checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
-        model.load_state_dict(checkpoint["model_state"])
-        model = nn.DataParallel(model)
-        model.to(device)
+    iteration, best_score = 0, -1.0
+    if opts.ckpt:
+        checkpoint = utils.load_checkpoint(opts.ckpt, model, map_location=device)
         if opts.continue_training:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
-            cur_itrs = checkpoint["cur_itrs"]
-            best_score = checkpoint['best_score']
-            print("Training state restored from %s" % opts.ckpt)
-        print("Model restored from %s" % opts.ckpt)
-        del checkpoint  # free memory
-    else:
-        print("[!] Retrain")
-        model = nn.DataParallel(model)
-        model.to(device)
-
-    # ==========   Train Loop   ==========#
-    vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
-                                      np.int32) if opts.enable_vis else None  # sample idxs for visualization
-    denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
+            iteration = checkpoint.get("iteration", checkpoint.get("cur_itrs", 0))
+            best_score = checkpoint.get("best_score", -1.0)
+        print("loaded: %s" % opts.ckpt)
 
     if opts.test_only:
-        model.eval()
-        val_score, ret_samples = validate(
-            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics)
-        print(metrics.to_str(val_score))
+        score = validate(
+            model, val_loader, device, metrics,
+            opts.val_tile_size, opts.val_overlap,
+        )
+        print(metrics.to_str(score))
         return
 
-    interval_loss = 0
-    while True:
-        # =====  Train  =====
-        model.train()
-        cur_epochs += 1
-        for (images, labels) in train_loader:
-            cur_itrs += 1
+    checkpoint_dir = Path(opts.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    running_loss = 0.0
+    model.train()
 
-            images = images.to(device, dtype=torch.float32)
-            labels = labels.to(device, dtype=torch.long)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            np_loss = loss.detach().cpu().numpy()
-            interval_loss += np_loss
-            # if vis is not None:
-            #     vis.vis_scalar('Loss', cur_itrs, np_loss)
-
-            if (cur_itrs) % 10 == 0:
-                interval_loss = interval_loss / 10
-                print("Epoch %d, Itrs %d/%d, Loss=%f" %
-                      (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
-                interval_loss = 0.0
-
-            if (cur_itrs) % opts.val_interval == 0:
-                save_ckpt('checkpoints/latest_%s_os%d.pth' %
-                          (opts.model, opts.output_stride))
-                print("validation...")
-                model.eval()
-                val_score, ret_samples = validate(
-                    opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
-                    )
-                print(metrics.to_str(val_score))
-                if val_score['Mean IoU'] > best_score:  # save best model
-                    best_score = val_score['Mean IoU']
-                    save_ckpt('checkpoints/best_%s_os%d.pth' %
-                              (opts.model, opts.output_stride))
-
-                # if vis is not None:  # visualize validation score and samples
-                #     vis.vis_scalar("[Val] Overall Acc", cur_itrs, val_score['Overall Acc'])
-                #     vis.vis_scalar("[Val] Mean IoU", cur_itrs, val_score['Mean IoU'])
-                #     vis.vis_table("[Val] Class IoU", val_score['Class IoU'])
-                #
-                #     for k, (img, target, lbl) in enumerate(ret_samples):
-                #         img = (denorm(img) * 255).astype(np.uint8)
-                #         target = train_dst.decode_target(target).transpose(2, 0, 1).astype(np.uint8)
-                #         lbl = train_dst.decode_target(lbl).transpose(2, 0, 1).astype(np.uint8)
-                #         concat_img = np.concatenate((img, target, lbl), axis=2)  # concat along width
-                #         vis.vis_image('Sample %d' % k, concat_img)
-                model.train()
+    while iteration < opts.total_itrs:
+        for images, labels in train_loader:
+            if iteration >= opts.total_itrs:
+                break
+            images = images.to(device, dtype=torch.float32, non_blocking=True)
+            labels = labels.to(device, dtype=torch.long, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                loss = criterion(model(images), labels)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), opts.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
-            if cur_itrs >= opts.total_itrs:
-                return
+            iteration += 1
+            running_loss += loss.detach().item()
+            if iteration % opts.print_interval == 0:
+                print(
+                    "iteration %d/%d  loss %.5f  lr %.2e"
+                    % (iteration, opts.total_itrs,
+                       running_loss / opts.print_interval,
+                       optimizer.param_groups[-1]["lr"])
+                )
+                running_loss = 0.0
+
+            if iteration % opts.val_interval == 0 or iteration == opts.total_itrs:
+                score = validate(
+                    model, val_loader, device, metrics,
+                    opts.val_tile_size, opts.val_overlap,
+                )
+                print(metrics.to_str(score))
+                handwriting_iou = score["Handwriting IoU"]
+                improved = (
+                    not np.isnan(handwriting_iou) and handwriting_iou > best_score
+                )
+                if improved:
+                    best_score = handwriting_iou
+                save_checkpoint(
+                    checkpoint_dir / "latest.pth", model, optimizer, scheduler,
+                    opts, iteration, best_score,
+                )
+                if improved:
+                    save_checkpoint(
+                        checkpoint_dir / "best.pth", model, optimizer, scheduler,
+                        opts, iteration, best_score,
+                    )
+                model.train()
 
 
-# python3 main.py --data_root /home/disk2/ray/datasets/HandWriting --loss_type focal_loss --gpu_id 2 --batch_size 4
-# python3 main.py --data_root /home/disk2/ray/datasets/HandWriting --loss_type focal_loss --gpu_id 2 --batch_size 4 --ckpt checkpoints/best_deeplabv3plus_resnet50_os16.pth --test_only --save_val_results
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -3,6 +3,7 @@ from ._deeplab import DeepLabHead, DeepLabHeadV3Plus, DeepLabV3
 from .backbone import resnet
 from .backbone import mobilenetv2
 from .backbone import hrnetv2
+from .lite_eraser import lite_eraser
 
 
 def _segm_hrnet(name, backbone_name, num_classes, pretrained_backbone):
@@ -99,11 +100,11 @@ def _load_model(arch_type, backbone, num_classes, output_stride, pretrained_back
 
 # Deeplab v3
 def deeplabv3_hrnetv2_48(num_classes=21, output_stride=4, pretrained_backbone=False):  # no pretrained backbone yet
-    return _load_model('deeplabv3', 'hrnetv2_48', output_stride, num_classes, pretrained_backbone=pretrained_backbone)
+    return _load_model('deeplabv3', 'hrnetv2_48', num_classes, output_stride, pretrained_backbone=pretrained_backbone)
 
 
 def deeplabv3_hrnetv2_32(num_classes=21, output_stride=4, pretrained_backbone=True):
-    return _load_model('deeplabv3', 'hrnetv2_32', output_stride, num_classes, pretrained_backbone=pretrained_backbone)
+    return _load_model('deeplabv3', 'hrnetv2_32', num_classes, output_stride, pretrained_backbone=pretrained_backbone)
 
 
 def deeplabv3_resnet50(num_classes=21, output_stride=8, pretrained_backbone=True):
