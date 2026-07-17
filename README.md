@@ -173,6 +173,20 @@ python predict.py \
 
 导出时会在 CPU 上比较 eager 与 TorchScript 输出，不一致时拒绝生成模型。
 
+### 导出 ONNX
+
+手机端部署建议优先评估 ONNX Runtime Mobile。导出的 ONNX 输入是已经完成 RGB、归一化后的 `float32 NCHW` 张量，输出是 3 类 logits，通道维 `argmax` 后得到类别 id，其中 `1` 是手写。
+
+```bash
+python export_onnx.py \
+  --checkpoint /Users/peng/Documents/models/hw_clear/cpu_v1/best.pth \
+  --output /Users/peng/Documents/models/hw_clear/cpu_v1/best.onnx \
+  --height 512 \
+  --width 512
+```
+
+默认导出动态 batch/height/width，并用 ONNX Runtime 在 CPU 上校验 512×512 和另一个非方形尺寸；如果手机端框架要求固定输入尺寸，可加 `--fixed-shape`。
+
 ## 旧模型兼容说明
 
 新训练生成的 checkpoint 会自动记录模型配置。旧 checkpoint 没有这些元数据，推理时必须显式指定其真实配置，例如：
