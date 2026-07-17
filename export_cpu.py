@@ -18,7 +18,7 @@ def get_argparser():
     parser.add_argument("--model", default=None,
                         help="required only for metadata-free legacy checkpoints")
     parser.add_argument("--num-classes", type=int, default=None)
-    parser.add_argument("--output-stride", type=int, default=None, choices=[8, 16])
+    parser.add_argument("--output-stride", type=int, default=None, choices=[8, 16, 32])
     return parser
 
 

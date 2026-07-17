@@ -32,7 +32,7 @@ def get_argparser():
     parser.add_argument("--tile-batch-size", type=int, default=1)
     parser.add_argument("--model", default=None)
     parser.add_argument("--num-classes", type=int, default=None)
-    parser.add_argument("--output-stride", type=int, default=None, choices=[8, 16])
+    parser.add_argument("--output-stride", type=int, default=None, choices=[8, 16, 32])
     parser.add_argument("--handwriting-class", type=int, default=1)
     parser.add_argument("--dilate", type=int, default=1,
                         help="mask dilation radius in pixels")

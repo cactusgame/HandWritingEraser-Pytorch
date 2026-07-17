@@ -5,3 +5,4 @@ pillow>=9.5
 tqdm>=4.65
 onnx>=1.16
 onnxruntime>=1.18
+tensorboard>=2.14

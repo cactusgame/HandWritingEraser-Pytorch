@@ -34,29 +34,44 @@ def get_argparser():
         if name.islower()
         and not name.startswith("_")
         and callable(value)
-        and (name.startswith("deeplab") or name == "lite_eraser")
+        and (name.startswith("deeplab") or name.endswith("eraser"))
     )
-    parser.add_argument("--model", default="lite_eraser", choices=available_models)
-    parser.add_argument("--output-stride", "--output_stride", type=int, default=16, choices=[8, 16])
+    parser.add_argument("--model", default="server_eraser", choices=available_models)
+    parser.add_argument(
+        "--output-stride", "--output_stride", type=int, default=None,
+        choices=[8, 16, 32],
+        help="defaults to 32 for server_eraser and 16 for other models",
+    )
     parser.add_argument("--num-classes", type=int, default=3, choices=[3])
     parser.add_argument("--pretrained-backbone", dest="pretrained_backbone", action="store_true")
     parser.add_argument("--no-pretrained-backbone", dest="pretrained_backbone", action="store_false")
     parser.set_defaults(pretrained_backbone=True)
 
-    parser.add_argument("--total-itrs", "--total_itrs", type=int, default=30000)
-    parser.add_argument("--batch-size", "--batch_size", type=int, default=8)
-    parser.add_argument("--crop-size", "--crop_size", type=int, default=768)
+    parser.add_argument("--total-itrs", "--total_itrs", type=int, default=60000)
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=4)
+    parser.add_argument("--crop-size", "--crop_size", type=int, default=640)
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--backbone-lr-mult", type=float, default=0.25)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--warmup-itrs", type=int, default=500)
-    parser.add_argument("--loss", "--loss_type", default="hybrid",
-                        choices=["hybrid", "focal", "cross_entropy"])
-    parser.add_argument("--class-weights", default="1,4,2",
+    parser.add_argument("--warmup-itrs", type=int, default=1000)
+    parser.add_argument("--loss", "--loss_type", default="structure",
+                        choices=["structure", "hybrid", "focal", "cross_entropy"])
+    parser.add_argument("--class-weights", default="1,3,2",
                         help="background,handwriting,print weights")
     parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument("--tversky-weight", type=float, default=0.7)
+    parser.add_argument("--boundary-weight", type=float, default=0.2)
+    parser.add_argument("--tversky-alpha", type=float, default=0.35,
+                        help="false-positive weight in handwriting Tversky loss")
+    parser.add_argument("--tversky-beta", type=float, default=0.65,
+                        help="false-negative weight; larger values reduce missed ink")
+    parser.add_argument("--tversky-gamma", type=float, default=0.75)
+    parser.add_argument("--boundary-radius", type=int, default=2)
+    parser.add_argument("--label-smoothing", type=float, default=0.02)
     parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--val-list", default=None,
                         help="validation stems for a single legacy data root")
@@ -70,8 +85,8 @@ def get_argparser():
         help="optional comma-separated source weights in --data-root order",
     )
     parser.add_argument("--random-seed", "--random_seed", type=int, default=1)
-    parser.add_argument("--print-interval", type=int, default=20)
-    parser.add_argument("--val-interval", "--val_interval", type=int, default=500)
+    parser.add_argument("--print-interval", type=int, default=50)
+    parser.add_argument("--val-interval", "--val_interval", type=int, default=2000)
     parser.add_argument("--val-tile-size", type=int, default=1024)
     parser.add_argument("--val-overlap", type=int, default=128)
 
@@ -135,11 +150,16 @@ def parse_dataset_weights(value, count):
 def get_datasets(opts):
     train_transform = et.ExtCompose([
         et.ExtColorJitter(brightness=0.25, contrast=0.25, saturation=0.15),
+        et.ExtRandomDocumentRotation(degrees=2.0, p=0.35),
         et.ExtRandomScale((0.75, 1.5)),
         et.ExtEnsureMinSize(opts.crop_size),
         et.ExtForegroundRandomCrop(
-            opts.crop_size, target_classes=(1,), min_foreground_ratio=0.001
+            opts.crop_size,
+            target_classes=(1,),
+            min_foreground_ratio=0.001,
+            foreground_probability=0.75,
         ),
+        et.ExtRandomDocumentDegradation(p=0.6),
         et.ExtToTensor(),
         et.ExtNormalize(MEAN, STD),
     ])
@@ -188,7 +208,7 @@ def parameter_groups(model, lr, backbone_lr_mult):
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith(("low_level", "high_level", "backbone")):
+        if name.startswith(("low_level", "high_level", "backbone", "encoder_")):
             backbone.append(parameter)
         else:
             decoder.append(parameter)
@@ -271,10 +291,10 @@ def print_validation_scores(overall_score, source_scores, metrics):
 
 
 def validation_selection_score(source_scores):
-    """Macro-average domains so high-resolution SCUT pages do not dominate."""
-    values = [score["Handwriting IoU"] for score in source_scores.values()]
+    """Balance handwriting removal and printed-content preservation by domain."""
+    values = [score["Erase Quality"] for score in source_scores.values()]
     value = float(np.nanmean(values))
-    print("validation macro Handwriting IoU: %.6f" % value)
+    print("validation macro Erase Quality: %.6f" % value)
     return value
 
 
@@ -305,7 +325,7 @@ def write_score_scalars(writer, prefix, score, iteration):
 
 
 def write_validation_scalars(
-    writer, iteration, overall_score, source_scores, macro_handwriting_iou
+    writer, iteration, overall_score, source_scores, macro_selection_score
 ):
     if writer is None:
         return
@@ -314,6 +334,15 @@ def write_validation_scalars(
         write_score_scalars(
             writer, "validation/%s" % _tb_name(source_name), score, iteration
         )
+    _write_scalar(
+        writer,
+        "validation/macro/Erase_Quality",
+        macro_selection_score,
+        iteration,
+    )
+    macro_handwriting_iou = float(
+        np.nanmean([score["Handwriting IoU"] for score in source_scores.values()])
+    )
     _write_scalar(
         writer,
         "validation/macro/Handwriting_IoU",
@@ -341,16 +370,23 @@ def create_summary_writer(opts, checkpoint_dir):
     return writer
 
 
-def save_checkpoint(path, model, optimizer, scheduler, opts, iteration, best_score):
+def save_checkpoint(
+    path, model, inference_model, optimizer, scheduler, opts, iteration, best_score,
+    ema_updates=0,
+):
     state = {
-        "format_version": 2,
+        "format_version": 3,
         "iteration": iteration,
         "cur_itrs": iteration,
-        "model_state": utils.unwrap_model(model).state_dict(),
+        # Inference and export load model_state by default. When EMA is enabled,
+        # this is the smoother model that was actually evaluated.
+        "model_state": utils.unwrap_model(inference_model).state_dict(),
+        "training_model_state": utils.unwrap_model(model).state_dict(),
+        "ema_updates": ema_updates,
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "best_score": best_score,
-        "best_score_name": "validation macro Handwriting IoU",
+        "best_score_name": "validation macro Erase Quality",
         "model_config": {
             "model": opts.model,
             "num_classes": opts.num_classes,
@@ -363,6 +399,18 @@ def save_checkpoint(path, model, optimizer, scheduler, opts, iteration, best_sco
             "sampling": opts.dataset_sampling,
             "dataset_weights": opts.dataset_weights,
         },
+        "training_config": {
+            "loss": opts.loss,
+            "class_weights": opts.class_weights,
+            "tversky_weight": opts.tversky_weight,
+            "boundary_weight": opts.boundary_weight,
+            "tversky_alpha": opts.tversky_alpha,
+            "tversky_beta": opts.tversky_beta,
+            "tversky_gamma": opts.tversky_gamma,
+            "boundary_radius": opts.boundary_radius,
+            "label_smoothing": opts.label_smoothing,
+            "ema_decay": None if opts.no_ema else opts.ema_decay,
+        },
     }
     torch.save(state, path)
     print("saved: %s" % path)
@@ -370,6 +418,8 @@ def save_checkpoint(path, model, optimizer, scheduler, opts, iteration, best_sco
 
 def main():
     opts = get_argparser().parse_args()
+    if opts.output_stride is None:
+        opts.output_stride = 32 if opts.model == "server_eraser" else 16
     os.environ["CUDA_VISIBLE_DEVICES"] = opts.gpu_id
     device = resolve_device(opts.device)
     seed_everything(opts.random_seed)
@@ -435,13 +485,28 @@ def main():
     )
     class_weights = parse_class_weights(opts.class_weights, opts.num_classes)
     criterion = utils.build_loss(
-        opts.loss, class_weights, opts.dice_weight
+        opts.loss,
+        class_weights,
+        opts.dice_weight,
+        tversky_weight=opts.tversky_weight,
+        boundary_weight=opts.boundary_weight,
+        tversky_alpha=opts.tversky_alpha,
+        tversky_beta=opts.tversky_beta,
+        tversky_gamma=opts.tversky_gamma,
+        boundary_radius=opts.boundary_radius,
+        label_smoothing=opts.label_smoothing,
     ).to(device)
     metrics = StreamSegMetrics(opts.num_classes)
 
     iteration, best_score = 0, -1.0
+    checkpoint = None
     if opts.ckpt:
-        checkpoint = utils.load_checkpoint(opts.ckpt, model, map_location=device)
+        checkpoint = utils.load_checkpoint(
+            opts.ckpt,
+            model,
+            map_location=device,
+            state_key="training_model_state" if opts.continue_training else None,
+        )
         if opts.continue_training:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -449,18 +514,28 @@ def main():
             best_score = checkpoint.get("best_score", -1.0)
         print("loaded: %s" % opts.ckpt)
 
+    ema = None if opts.no_ema else utils.ModelEMA(
+        model, decay=opts.ema_decay,
+        updates=checkpoint.get("ema_updates", 0) if checkpoint else 0,
+    )
+    if ema is not None and checkpoint and "model_state" in checkpoint:
+        ema.load_state_dict(
+            checkpoint["model_state"], checkpoint.get("ema_updates", 0)
+        )
+    validation_model = ema.module if ema is not None else model
+
     checkpoint_dir = Path(opts.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     writer = create_summary_writer(opts, checkpoint_dir)
 
     if opts.test_only:
         score, source_scores = validate_sources(
-            model, validation_loaders, device, metrics,
+            validation_model, validation_loaders, device, metrics,
             opts.val_tile_size, opts.val_overlap,
         )
         print_validation_scores(score, source_scores, metrics)
-        handwriting_iou = validation_selection_score(source_scores)
-        write_validation_scalars(writer, iteration, score, source_scores, handwriting_iou)
+        selection_score = validation_selection_score(source_scores)
+        write_validation_scalars(writer, iteration, score, source_scores, selection_score)
         if writer is not None:
             writer.close()
         return
@@ -468,6 +543,7 @@ def main():
     use_amp = device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     running_loss = 0.0
+    running_components = {}
     model.train()
 
     while iteration < opts.total_itrs:
@@ -485,9 +561,15 @@ def main():
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            if ema is not None:
+                ema.update(model)
 
             iteration += 1
             running_loss += loss.detach().item()
+            for name, value in getattr(criterion, "last_components", {}).items():
+                running_components[name] = (
+                    running_components.get(name, 0.0) + float(value.item())
+                )
             if iteration % opts.print_interval == 0:
                 train_loss = running_loss / opts.print_interval
                 print(
@@ -501,31 +583,40 @@ def main():
                     writer.add_scalar(
                         "train/lr", optimizer.param_groups[-1]["lr"], iteration
                     )
+                    for name, value in running_components.items():
+                        writer.add_scalar(
+                            "train/loss_%s" % name,
+                            value / opts.print_interval,
+                            iteration,
+                        )
                 running_loss = 0.0
+                running_components.clear()
 
             if iteration % opts.val_interval == 0 or iteration == opts.total_itrs:
                 score, source_scores = validate_sources(
-                    model, validation_loaders, device, metrics,
+                    validation_model, validation_loaders, device, metrics,
                     opts.val_tile_size, opts.val_overlap,
                 )
                 print_validation_scores(score, source_scores, metrics)
-                handwriting_iou = validation_selection_score(source_scores)
+                selection_score = validation_selection_score(source_scores)
                 write_validation_scalars(
-                    writer, iteration, score, source_scores, handwriting_iou
+                    writer, iteration, score, source_scores, selection_score
                 )
                 improved = (
-                    not np.isnan(handwriting_iou) and handwriting_iou > best_score
+                    not np.isnan(selection_score) and selection_score > best_score
                 )
                 if improved:
-                    best_score = handwriting_iou
+                    best_score = selection_score
                 save_checkpoint(
-                    checkpoint_dir / "latest.pth", model, optimizer, scheduler,
-                    opts, iteration, best_score,
+                    checkpoint_dir / "latest.pth", model, validation_model,
+                    optimizer, scheduler, opts, iteration, best_score,
+                    ema.updates if ema is not None else 0,
                 )
                 if improved:
                     save_checkpoint(
-                        checkpoint_dir / "best.pth", model, optimizer, scheduler,
-                        opts, iteration, best_score,
+                        checkpoint_dir / "best.pth", model, validation_model,
+                        optimizer, scheduler, opts, iteration, best_score,
+                        ema.updates if ema is not None else 0,
                     )
                 model.train()
 

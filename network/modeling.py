@@ -3,7 +3,7 @@ from ._deeplab import DeepLabHead, DeepLabHeadV3Plus, DeepLabV3
 from .backbone import resnet
 from .backbone import mobilenetv2
 from .backbone import hrnetv2
-from .lite_eraser import lite_eraser
+from .lite_eraser import lite_eraser, quality_eraser, server_eraser
 
 
 def _segm_hrnet(name, backbone_name, num_classes, pretrained_backbone):

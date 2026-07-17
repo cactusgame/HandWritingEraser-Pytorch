@@ -1,11 +1,12 @@
 from collections.abc import Iterable
+import io
 import torchvision
 import torch
 import torchvision.transforms.functional as F
 import random
 import numbers
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 
 
 #  Extended Transforms for Semantic Segmentation
@@ -426,11 +427,14 @@ class ExtForegroundRandomCrop(ExtRandomCrop):
     """Prefer crops containing enough pixels from selected rare classes."""
 
     def __init__(self, size, target_classes=(1,), min_foreground_ratio=0.001,
-                 attempts=10):
+                 attempts=10, foreground_probability=1.0):
         super().__init__(size, pad_if_needed=True)
         self.target_classes = tuple(target_classes)
         self.min_foreground_ratio = min_foreground_ratio
         self.attempts = attempts
+        if not 0.0 <= foreground_probability <= 1.0:
+            raise ValueError("foreground_probability must be in [0, 1]")
+        self.foreground_probability = foreground_probability
 
     def __call__(self, img, lbl):
         assert img.size == lbl.size
@@ -442,7 +446,8 @@ class ExtForegroundRandomCrop(ExtRandomCrop):
             lbl = F.pad(lbl, padding, fill=0)
 
         selected = self.get_params(img, self.size)
-        for _ in range(self.attempts):
+        attempts = self.attempts if random.random() < self.foreground_probability else 0
+        for _ in range(attempts):
             candidate = self.get_params(img, self.size)
             i, j, h, w = candidate
             crop_lbl = F.crop(lbl, i, j, h, w)
@@ -453,6 +458,53 @@ class ExtForegroundRandomCrop(ExtRandomCrop):
                 break
         i, j, h, w = selected
         return F.crop(img, i, j, h, w), F.crop(lbl, i, j, h, w)
+
+
+class ExtRandomDocumentRotation(object):
+    """Small joint rotation with correct fill values and label interpolation."""
+
+    def __init__(self, degrees=2.0, p=0.35):
+        self.degrees = float(degrees)
+        self.p = p
+
+    def __call__(self, img, lbl):
+        if random.random() >= self.p:
+            return img, lbl
+        angle = random.uniform(-self.degrees, self.degrees)
+        image = img.rotate(
+            angle, resample=Image.BILINEAR, expand=False, fillcolor=(255, 255, 255)
+        )
+        label = lbl.rotate(
+            angle, resample=Image.NEAREST, expand=False, fillcolor=0
+        )
+        return image, label
+
+
+class ExtRandomDocumentDegradation(object):
+    """Simulate blur, grayscale scans, sensor noise and JPEG compression."""
+
+    def __init__(self, p=0.6):
+        self.p = p
+
+    def __call__(self, img, lbl):
+        if random.random() >= self.p:
+            return img, lbl
+
+        if random.random() < 0.25:
+            img = img.filter(ImageFilter.GaussianBlur(random.uniform(0.1, 1.1)))
+        if random.random() < 0.12:
+            img = ImageOps.grayscale(img).convert("RGB")
+        if random.random() < 0.25:
+            array = np.asarray(img, dtype=np.float32)
+            noise = np.random.normal(0.0, random.uniform(1.5, 6.0), array.shape)
+            img = Image.fromarray(np.clip(array + noise, 0, 255).astype(np.uint8))
+        if random.random() < 0.25:
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=random.randint(50, 92))
+            buffer.seek(0)
+            with Image.open(buffer) as compressed:
+                img = compressed.convert("RGB")
+        return img, lbl
 
 
 class ExtResize(object):

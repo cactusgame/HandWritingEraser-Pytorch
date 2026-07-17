@@ -88,16 +88,27 @@ class StreamSegMetrics(_StreamMetrics):
         else:
             hand_precision = hand_recall = hand_f1 = 0.0
 
+        hand_iou = iu[1] if self.n_classes > 1 else mean_iu
+        print_iou = iu[2] if self.n_classes > 2 else np.nan
+        if np.isfinite(hand_iou) and np.isfinite(print_iou):
+            # Geometric mean prevents a model that removes more handwriting by
+            # sacrificing printed content from being selected as "best".
+            erase_quality = np.sqrt(max(0.0, hand_iou) * max(0.0, print_iou))
+        else:
+            erase_quality = hand_iou
+
         return {
             "Overall Acc": acc,
             "Mean Acc": acc_cls,
             "FreqW Acc": fwavacc,
             "Mean IoU": mean_iu,
             "Foreground Mean IoU": np.nanmean(iu[1:]) if self.n_classes > 1 else mean_iu,
-            "Handwriting IoU": iu[1] if self.n_classes > 1 else mean_iu,
+            "Handwriting IoU": hand_iou,
             "Handwriting Precision": hand_precision,
             "Handwriting Recall": hand_recall,
             "Handwriting F1": hand_f1,
+            "Print IoU": print_iou,
+            "Erase Quality": erase_quality,
             "Class IoU": cls_iu,
         }
 

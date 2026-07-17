@@ -1,6 +1,6 @@
-# HandWriting Eraser 2.0
+# HandWriting Eraser 3.0
 
-这是一个把试卷像素分成 `背景(0) / 手写(1) / 印刷(2)` 三类，并将手写区域擦除为白色的语义分割项目。本次升级的默认模型面向 CPU 推理，同时保留旧 DeepLabV3+ 模型入口，便于对照实验。
+这是一个把试卷像素分成 `背景(0) / 手写(1) / 印刷(2)` 三类，并将手写区域擦除为白色的语义分割项目。3.0 的默认模型以 4–8 核 CPU 服务端为目标，精度优先但不依赖 GPU、手机 NPU 或特殊算子；同时保留轻量模型和旧 DeepLabV3+ 入口，便于做速度/精度对照。
 
 ## 为什么升级
 
@@ -13,12 +13,20 @@
 - 训练固定把页面拉伸到 `1024×1024`，破坏试卷和字形比例；训练与推理归一化还分别使用了 `[0.5]` 和 ImageNet 参数。
 - 训练使用 3 类，两个旧推理脚本却构建 2 类模型；checkpoint 名称、实际 backbone 和类别数可能互相矛盾。
 
-升级后的 `lite_eraser` 使用 MobileNetV2 编码器和轻量上下文门控解码器。stride-4 浅层特征用于保留细笔画，高层全局门控提供页面上下文，深度可分离卷积完成融合。相比 ResNet-101 + ASPP，它更适合 CPU，且训练、验证、普通推理和 TorchScript 导出共用同一模型配置。
+当前提供三档 CPU 模型：
+
+- `server_eraser`（默认）：ImageNet 预训练 ResNet-18 编码器，使用 stride 32 上下文和 stride 16/8/4/2 逐级解码。它用更多语义容量区分形态相近的手写、印刷批注和表格线，适合 4–8 核服务端。
+- `quality_eraser`：MobileNetV2 编码器，同样具有多尺度上下文和 stride 8/4/2 解码，速度和效果居中。
+- `lite_eraser`：原 2.0 轻量模型，只有 stride-4 跳连，速度最快，适合资源很紧的场景。
+
+三个模型都只包含标准卷积、深度可分离卷积、池化和双线性插值，可在普通 PyTorch CPU、TorchScript 或 ONNX Runtime CPU 上运行。训练、验证、推理和导出共用 checkpoint 中的模型配置。
 
 | 模型 | 参数量 | FP32 权重 | 本机 CPU 256×256 延迟（4 线程） |
 | --- | ---: | ---: | ---: |
 | 旧 DeepLabV3+ ResNet-101 | 58.75 M | 224.1 MiB | 约 498 ms |
 | 新 `lite_eraser` | 1.92 M | 7.3 MiB | 约 98 ms |
+| 新 `quality_eraser` | 1.96 M | 7.5 MiB | 约 206 ms |
+| 新 `server_eraser` | 11.52 M | 44.0 MiB | 约 331 ms |
 
 延迟是在当前 x86_64 机器、PyTorch 2.2.2 上预热后测得，只用于量级对比。模型精度仍需在完整数据集上重新训练并以独立验证集评估；仓库内没有附带原始训练图片和标签，因此本次升级不虚构精度结果。
 
@@ -30,13 +38,15 @@
 - 原 focal loss 的标量 `alpha=0.25` 统一乘到所有类别，只改变损失尺度，没有改变类别相对权重，因此不能真正解决类别不平衡。
 - 只优化逐像素分类，没有直接约束细小前景区域的重叠质量。
 
-默认损失升级为：
+2.0 的 `weighted CE + Dice` 仍有两个问题：Dice 对漏检和误检一视同仁，无法按业务代价强调“残留手写”；同时它对细笔画边界没有直接监督，擦除后容易留下彩色边缘。3.0 默认损失升级为：
 
 ```text
-loss = class-weighted cross entropy + 0.5 × foreground soft Dice
+loss = class-weighted CE
+     + 0.7 × handwriting Tversky(alpha=0.35, beta=0.65)
+     + 0.2 × handwriting boundary BCE
 ```
 
-默认类别权重为 `1,4,2`，强调手写类；应根据自己的训练集统计通过 `--class-weights` 调整。focal loss 也已修复，可接收逐类别权重。最佳模型不再按容易被背景抬高的 overall accuracy 或 mean IoU 保存，而按 `Handwriting IoU` 保存。
+`beta > alpha` 让漏擦比误擦受到更大惩罚；边界带 BCE 专门约束笔画内外两侧，减少断笔和边缘残留。默认类别权重为 `1,3,2`：抽样统计中 Baidu/SCUT 的手写像素约占 2.6%–3.1%，但前景裁剪已经显著提高其训练出现率，所以不再用过大的手写权重。最佳 checkpoint 按各数据源 `sqrt(Handwriting IoU × Print IoU)` 的宏平均保存，防止靠误擦印刷内容换取手写召回。
 
 ### 3. 原训练方法的问题
 
@@ -45,7 +55,7 @@ loss = class-weighted cross entropy + 0.5 × foreground soft Dice
 - README 提到重叠裁剪增强，但训练代码实际上只有固定 resize；随机裁剪也可能抽到几乎全背景区域。
 - SGD 初始学习率较高、没有 warmup、没有梯度裁剪；GPU 与 CPU checkpoint 依赖 `DataParallel` 包装。
 
-现在按文件 stem 严格配对并检查尺寸，用固定随机种子切分；训练采用比例不变的随机缩放、手写类感知随机裁剪和温和颜色增强；优化器使用 AdamW、backbone 较小学习率、warmup-poly 调度与梯度裁剪。AMP 只在 CUDA 上开启。checkpoint 始终保存未包装模型的权重，可直接映射到 CPU。
+现在按文件 stem 严格配对并检查尺寸，用固定随机种子切分；训练采用比例不变的随机缩放、小角度旋转、颜色变化、模糊/噪声/JPEG 文档退化增强。75% crop 主动寻找手写区域，25% 保持普通随机裁剪，避免模型没见过足够的纯背景/印刷区域而误擦。优化器使用 AdamW、backbone 较小学习率、warmup-poly 调度、梯度裁剪和 EMA；验证与默认部署均使用 EMA 权重，恢复训练则使用同时保存的原始训练权重。AMP 只在 CUDA 上开启。
 
 ## 环境
 
@@ -104,14 +114,17 @@ python main.py \
   --data-root /Users/peng/Documents/data/HandWritingData/baidu \
   --data-root /Users/peng/Documents/data/HandWritingData/SCUT-EnsExam-baidu-format \
   --data-root /Users/peng/Documents/data/HandWritingData/SignaTR6K-baidu-format \
-  --model lite_eraser \
+  --model server_eraser \
+  --output-stride 32 \
   --dataset-sampling balanced \
-  --batch-size 8 \
-  --crop-size 512 \
-  --total-itrs 30000
+  --batch-size 4 \
+  --crop-size 640 \
+  --total-itrs 60000
 ```
 
-`--data-root` 可以重复任意次数。默认 `balanced` 让每个数据集获得相同的抽样概率，避免样本最多的 SignaTR6K 主导训练；`--dataset-sampling proportional` 恢复按样本数混合，`--dataset-weights 2,1,1` 可自定义三个数据源的相对概率。验证时会分别打印每个数据集及总集合的指标，最佳模型按各数据集 `Handwriting IoU` 的宏平均保存，避免高分辨率 SCUT 页面仅凭像素数主导模型选择。
+如果 CPU 延迟比最高精度更重要，把模型换成 `quality_eraser --output-stride 16`；已有的 2.0 `lite_eraser` checkpoint 仍可直接推理，但不能直接加载到新结构继续训练。
+
+`--data-root` 可以重复任意次数。默认 `balanced` 让每个数据集获得相同的抽样概率，避免样本最多的 SignaTR6K 主导训练；`--dataset-sampling proportional` 恢复按样本数混合，`--dataset-weights 2,1,1` 可自定义三个数据源的相对概率。验证时会分别打印每个数据集及总集合的指标，最佳模型按各数据集 `Erase Quality` 的宏平均保存，避免高分辨率 SCUT 页面仅凭像素数主导模型选择，也同时约束印刷内容保留率。
 
 验证指标也会写入本地 TensorBoard event 文件，默认目录是 `<checkpoint-dir>/runs`。只会写本地文件，不会上传到网络。查看方式：
 

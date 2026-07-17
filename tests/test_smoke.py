@@ -13,7 +13,8 @@ from predict import tile_starts
 from tools.convert_scut_ensexam import make_three_class_label
 from tools.convert_signatr6k import convert_mask
 from utils.ext_transforms import ExtEnsureMinSize
-from utils.loss import HybridSegmentationLoss
+from utils import ModelEMA
+from utils.loss import HybridSegmentationLoss, StructureAwareLoss
 
 
 class UpgradeSmokeTests(unittest.TestCase):
@@ -29,6 +30,38 @@ class UpgradeSmokeTests(unittest.TestCase):
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
         self.assertLess(sum(p.numel() for p in model.parameters()), 2_000_000)
+
+    def test_server_model_cpu_forward_with_odd_shape(self):
+        model = network.modeling.server_eraser(
+            num_classes=3, output_stride=32, pretrained_backbone=False
+        ).eval()
+        inputs = torch.randn(1, 3, 65, 91)
+        with torch.inference_mode():
+            logits = model(inputs)
+        self.assertEqual(tuple(logits.shape), (1, 3, 65, 91))
+        parameter_count = sum(parameter.numel() for parameter in model.parameters())
+        self.assertLess(parameter_count, 12_000_000)
+
+    def test_structure_loss_and_ema(self):
+        logits = torch.randn(2, 3, 33, 41, requires_grad=True)
+        targets = torch.randint(0, 3, (2, 33, 41))
+        criterion = StructureAwareLoss([1, 3, 2])
+        loss = criterion(logits, targets)
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(
+            set(criterion.last_components),
+            {"cross_entropy", "tversky", "boundary"},
+        )
+
+        model = torch.nn.Conv2d(3, 3, 1)
+        ema = ModelEMA(model, decay=0.9)
+        before = ema.module.weight.detach().clone()
+        with torch.no_grad():
+            model.weight.add_(1.0)
+        ema.update(model)
+        self.assertFalse(torch.equal(before, ema.module.weight))
+        self.assertFalse(any(p.requires_grad for p in ema.module.parameters()))
 
     def test_tiles_cover_the_last_pixel(self):
         starts = tile_starts(1500, 768, 128)

@@ -18,9 +18,17 @@ def clean_state_dict(state_dict):
     return cleaned
 
 
-def load_checkpoint(path, model, map_location="cpu", strict=True):
+def load_checkpoint(
+    path, model, map_location="cpu", strict=True, state_key=None
+):
     checkpoint = torch.load(path, map_location=map_location)
-    if isinstance(checkpoint, dict) and "model_state" in checkpoint:
+    if (
+        state_key
+        and isinstance(checkpoint, dict)
+        and state_key in checkpoint
+    ):
+        state_dict = checkpoint[state_key]
+    elif isinstance(checkpoint, dict) and "model_state" in checkpoint:
         state_dict = checkpoint["model_state"]
     elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
