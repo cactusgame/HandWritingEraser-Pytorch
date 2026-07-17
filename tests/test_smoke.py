@@ -7,6 +7,7 @@ import torch
 from PIL import Image
 
 import network
+from main import write_validation_scalars
 from datasets import HWSegmentation, MultiSourceHWSegmentation
 from predict import tile_starts
 from tools.convert_scut_ensexam import make_three_class_label
@@ -110,6 +111,43 @@ class UpgradeSmokeTests(unittest.TestCase):
         image, label = ExtEnsureMinSize(64)(image, label)
         self.assertEqual(image.size, (128, 64))
         self.assertEqual(label.size, image.size)
+
+    def test_validation_metrics_are_written_to_tensorboard_writer(self):
+        class DummyWriter:
+            def __init__(self):
+                self.scalars = {}
+                self.flushed = False
+
+            def add_scalar(self, tag, value, step):
+                self.scalars[tag] = (value, step)
+
+            def flush(self):
+                self.flushed = True
+
+        writer = DummyWriter()
+        overall = {
+            "Overall Acc": 0.9,
+            "Handwriting IoU": 0.7,
+            "Class IoU": {0: 0.95, 1: 0.7, 2: np.nan},
+        }
+        source_scores = {
+            "SCUT/EnsExam": {
+                "Overall Acc": 0.8,
+                "Handwriting IoU": 0.6,
+                "Class IoU": {0: 0.9, 1: 0.6, 2: 0.5},
+            }
+        }
+
+        write_validation_scalars(writer, 12, overall, source_scores, 0.6)
+
+        self.assertEqual(writer.scalars["validation/all/Overall_Acc"], (0.9, 12))
+        self.assertEqual(writer.scalars["validation/all/Class_IoU/class_1"], (0.7, 12))
+        self.assertNotIn("validation/all/Class_IoU/class_2", writer.scalars)
+        self.assertEqual(
+            writer.scalars["validation/SCUT_EnsExam/Handwriting_IoU"], (0.6, 12)
+        )
+        self.assertEqual(writer.scalars["validation/macro/Handwriting_IoU"], (0.6, 12))
+        self.assertTrue(writer.flushed)
 
 
 if __name__ == "__main__":

@@ -113,6 +113,14 @@ python main.py \
 
 `--data-root` 可以重复任意次数。默认 `balanced` 让每个数据集获得相同的抽样概率，避免样本最多的 SignaTR6K 主导训练；`--dataset-sampling proportional` 恢复按样本数混合，`--dataset-weights 2,1,1` 可自定义三个数据源的相对概率。验证时会分别打印每个数据集及总集合的指标，最佳模型按各数据集 `Handwriting IoU` 的宏平均保存，避免高分辨率 SCUT 页面仅凭像素数主导模型选择。
 
+验证指标也会写入本地 TensorBoard event 文件，默认目录是 `<checkpoint-dir>/runs`。只会写本地文件，不会上传到网络。查看方式：
+
+```bash
+tensorboard --logdir checkpoints/runs
+```
+
+需要换目录可传 `--tensorboard-dir /path/to/runs`；需要完全关闭本地日志可传 `--no-tensorboard`。
+
 小尺寸 SignaTR6K 图像会先保持比例放大到训练 crop 的最小尺寸，不会在 768/512 crop 周围填充大面积空白。
 
 如果同一原始试卷生成了多个增强样本，建议把同源样本放在同一个 split，避免验证泄漏。可在文本文件中逐行写验证集文件 stem，并传入 `--val-list validation.txt`。

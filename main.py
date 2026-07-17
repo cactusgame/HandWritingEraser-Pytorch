@@ -81,6 +81,14 @@ def get_argparser():
     parser.add_argument("--continue-training", "--continue_training", action="store_true")
     parser.add_argument("--test-only", "--test_only", action="store_true")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument(
+        "--tensorboard-dir", default=None,
+        help="local TensorBoard log directory; defaults to <checkpoint-dir>/runs",
+    )
+    parser.add_argument(
+        "--no-tensorboard", action="store_true",
+        help="disable local TensorBoard event logging",
+    )
     return parser
 
 
@@ -270,6 +278,69 @@ def validation_selection_score(source_scores):
     return value
 
 
+def _tb_name(name):
+    return str(name).strip().replace(" ", "_").replace("/", "_")
+
+
+def _write_scalar(writer, tag, value, iteration):
+    if value is None:
+        return
+    value = float(value)
+    if np.isfinite(value):
+        writer.add_scalar(tag, value, iteration)
+
+
+def write_score_scalars(writer, prefix, score, iteration):
+    for name, value in score.items():
+        if name == "Class IoU":
+            for class_id, class_iou in value.items():
+                _write_scalar(
+                    writer,
+                    "%s/Class_IoU/class_%s" % (prefix, class_id),
+                    class_iou,
+                    iteration,
+                )
+        else:
+            _write_scalar(writer, "%s/%s" % (prefix, _tb_name(name)), value, iteration)
+
+
+def write_validation_scalars(
+    writer, iteration, overall_score, source_scores, macro_handwriting_iou
+):
+    if writer is None:
+        return
+    write_score_scalars(writer, "validation/all", overall_score, iteration)
+    for source_name, score in source_scores.items():
+        write_score_scalars(
+            writer, "validation/%s" % _tb_name(source_name), score, iteration
+        )
+    _write_scalar(
+        writer,
+        "validation/macro/Handwriting_IoU",
+        macro_handwriting_iou,
+        iteration,
+    )
+    writer.flush()
+
+
+def create_summary_writer(opts, checkpoint_dir):
+    if opts.no_tensorboard:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as exc:
+        raise RuntimeError(
+            "TensorBoard logging is enabled, but tensorboard is not installed. "
+            "Install it in the training environment or pass --no-tensorboard."
+        ) from exc
+
+    tensorboard_dir = Path(opts.tensorboard_dir or checkpoint_dir / "runs")
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(tensorboard_dir))
+    print("tensorboard logs: %s" % tensorboard_dir)
+    return writer
+
+
 def save_checkpoint(path, model, optimizer, scheduler, opts, iteration, best_score):
     state = {
         "format_version": 2,
@@ -378,16 +449,22 @@ def main():
             best_score = checkpoint.get("best_score", -1.0)
         print("loaded: %s" % opts.ckpt)
 
+    checkpoint_dir = Path(opts.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    writer = create_summary_writer(opts, checkpoint_dir)
+
     if opts.test_only:
         score, source_scores = validate_sources(
             model, validation_loaders, device, metrics,
             opts.val_tile_size, opts.val_overlap,
         )
         print_validation_scores(score, source_scores, metrics)
+        handwriting_iou = validation_selection_score(source_scores)
+        write_validation_scalars(writer, iteration, score, source_scores, handwriting_iou)
+        if writer is not None:
+            writer.close()
         return
 
-    checkpoint_dir = Path(opts.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     use_amp = device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     running_loss = 0.0
@@ -412,12 +489,18 @@ def main():
             iteration += 1
             running_loss += loss.detach().item()
             if iteration % opts.print_interval == 0:
+                train_loss = running_loss / opts.print_interval
                 print(
                     "iteration %d/%d  loss %.5f  lr %.2e"
                     % (iteration, opts.total_itrs,
-                       running_loss / opts.print_interval,
+                       train_loss,
                        optimizer.param_groups[-1]["lr"])
                 )
+                if writer is not None:
+                    writer.add_scalar("train/loss", train_loss, iteration)
+                    writer.add_scalar(
+                        "train/lr", optimizer.param_groups[-1]["lr"], iteration
+                    )
                 running_loss = 0.0
 
             if iteration % opts.val_interval == 0 or iteration == opts.total_itrs:
@@ -427,6 +510,9 @@ def main():
                 )
                 print_validation_scores(score, source_scores, metrics)
                 handwriting_iou = validation_selection_score(source_scores)
+                write_validation_scalars(
+                    writer, iteration, score, source_scores, handwriting_iou
+                )
                 improved = (
                     not np.isnan(handwriting_iou) and handwriting_iou > best_score
                 )
@@ -442,6 +528,9 @@ def main():
                         opts, iteration, best_score,
                     )
                 model.train()
+
+    if writer is not None:
+        writer.close()
 
 
 if __name__ == "__main__":
