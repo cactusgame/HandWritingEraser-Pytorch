@@ -1,4 +1,4 @@
-"""Training entry point for handwriting/print/background segmentation."""
+"""Training entry point for joint handwriting segmentation and restoration."""
 
 import argparse
 import os
@@ -13,9 +13,12 @@ from tqdm import tqdm
 
 import network
 import utils
-from datasets import HWSegmentation, MultiSourceHWSegmentation
+from datasets import (
+    HWRestorationDataset,
+    JointDocumentTransform,
+    MultiSourceHWRestoration,
+)
 from metrics import StreamSegMetrics
-from utils import ext_transforms as et
 
 
 MEAN = [0.485, 0.456, 0.406]
@@ -36,11 +39,11 @@ def get_argparser():
         and callable(value)
         and (name.startswith("deeplab") or name.endswith("eraser"))
     )
-    parser.add_argument("--model", default="server_eraser", choices=available_models)
+    parser.add_argument("--model", default="joint_eraser", choices=available_models)
     parser.add_argument(
         "--output-stride", "--output_stride", type=int, default=None,
         choices=[8, 16, 32],
-        help="defaults to 32 for server_eraser and 16 for other models",
+        help="defaults to 32 for server/joint eraser and 16 for other models",
     )
     parser.add_argument("--num-classes", type=int, default=3, choices=[3])
     parser.add_argument("--pretrained-backbone", dest="pretrained_backbone", action="store_true")
@@ -55,8 +58,8 @@ def get_argparser():
     parser.add_argument("--backbone-lr-mult", type=float, default=0.25)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-itrs", type=int, default=1000)
-    parser.add_argument("--loss", "--loss_type", default="structure",
-                        choices=["structure", "hybrid", "focal", "cross_entropy"])
+    parser.add_argument("--loss", "--loss_type", default="joint",
+                        choices=["joint", "structure", "hybrid", "focal", "cross_entropy"])
     parser.add_argument("--class-weights", default="1,3,2",
                         help="background,handwriting,print weights")
     parser.add_argument("--dice-weight", type=float, default=0.5)
@@ -69,6 +72,19 @@ def get_argparser():
     parser.add_argument("--tversky-gamma", type=float, default=0.75)
     parser.add_argument("--boundary-radius", type=int, default=2)
     parser.add_argument("--label-smoothing", type=float, default=0.02)
+    parser.add_argument("--reconstruction-weight", type=float, default=1.0)
+    parser.add_argument("--ssim-weight", type=float, default=0.4)
+    parser.add_argument("--edge-weight", type=float, default=0.3)
+    parser.add_argument("--color-weight", type=float, default=0.2)
+    parser.add_argument("--identity-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--freeze-segmentation-itrs", type=int, default=2000,
+        help="when initializing from cpu_v2, train only restoration heads first",
+    )
+    parser.add_argument(
+        "--synthetic-restoration-probability", type=float, default=0.5,
+        help="for unpaired sources, probability of overlaying real ink onto a clean region",
+    )
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--no-ema", action="store_true")
@@ -93,6 +109,10 @@ def get_argparser():
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--gpu-id", "--gpu_id", default="0")
     parser.add_argument("--ckpt", default=None)
+    parser.add_argument(
+        "--init-segmentation-ckpt", default=None,
+        help="initialize joint_eraser segmentation trunk from a server_eraser checkpoint",
+    )
     parser.add_argument("--continue-training", "--continue_training", action="store_true")
     parser.add_argument("--test-only", "--test_only", action="store_true")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
@@ -148,25 +168,12 @@ def parse_dataset_weights(value, count):
 
 
 def get_datasets(opts):
-    train_transform = et.ExtCompose([
-        et.ExtColorJitter(brightness=0.25, contrast=0.25, saturation=0.15),
-        et.ExtRandomDocumentRotation(degrees=2.0, p=0.35),
-        et.ExtRandomScale((0.75, 1.5)),
-        et.ExtEnsureMinSize(opts.crop_size),
-        et.ExtForegroundRandomCrop(
-            opts.crop_size,
-            target_classes=(1,),
-            min_foreground_ratio=0.001,
-            foreground_probability=0.75,
-        ),
-        et.ExtRandomDocumentDegradation(p=0.6),
-        et.ExtToTensor(),
-        et.ExtNormalize(MEAN, STD),
-    ])
-    eval_transform = et.ExtCompose([
-        et.ExtToTensor(),
-        et.ExtNormalize(MEAN, STD),
-    ])
+    train_transform = JointDocumentTransform(
+        crop_size=opts.crop_size, train=True, mean=MEAN, std=STD
+    )
+    eval_transform = JointDocumentTransform(
+        crop_size=opts.crop_size, train=False, mean=MEAN, std=STD
+    )
     roots = opts.data_roots or ["./datasets/data"]
     if opts.val_list and len(roots) != 1:
         raise ValueError("--val-list is only valid with one --data-root")
@@ -180,11 +187,17 @@ def get_datasets(opts):
             split_seed=opts.random_seed,
             val_list=opts.val_list,
         )
-        train_dataset = HWSegmentation(
-            transform=train_transform, split="train", **common
+        train_dataset = HWRestorationDataset(
+            transform=train_transform,
+            split="train",
+            synthetic_probability=opts.synthetic_restoration_probability,
+            **common,
         )
-        validation_dataset = HWSegmentation(
-            transform=eval_transform, split="validation", **common
+        validation_dataset = HWRestorationDataset(
+            transform=eval_transform,
+            split="validation",
+            synthetic_probability=0.0,
+            **common,
         )
         name = validation_dataset.dataset_name
         used_names[name] = used_names.get(name, 0) + 1
@@ -192,7 +205,7 @@ def get_datasets(opts):
             name = "%s#%d" % (name, used_names[name])
         train_sources.append(train_dataset)
         validation_sources.append((name, validation_dataset))
-    return MultiSourceHWSegmentation(train_sources), validation_sources
+    return MultiSourceHWRestoration(train_sources), validation_sources
 
 
 def build_model(opts, pretrained_backbone):
@@ -232,28 +245,42 @@ def tile_starts(length, tile_size, overlap):
 
 @torch.no_grad()
 def predict_page(model, image, device, tile_size, overlap):
-    """Return CPU logits while keeping full-resolution activations off the GPU."""
+    """Return CPU logits and optional restored RGB using overlap tiling."""
     if tile_size <= 0 or overlap < 0 or overlap >= tile_size:
         raise ValueError("validation needs 0 <= overlap < tile-size")
     height, width = image.shape[-2:]
     if height <= tile_size and width <= tile_size:
-        return model(image.to(device, dtype=torch.float32)).cpu()
+        outputs = model(image.to(device, dtype=torch.float32))
+        if isinstance(outputs, (tuple, list)):
+            return outputs[0].float().cpu(), outputs[-1].float().cpu()
+        return outputs.float().cpu(), None
 
     ys = tile_starts(height, tile_size, overlap)
     xs = tile_starts(width, tile_size, overlap)
     logits_sum = None
+    restored_sum = None
     weight_sum = torch.zeros((height, width), dtype=torch.float32)
     window_cache = {}
     for y in ys:
         for x in xs:
             crop = image[..., y:min(y + tile_size, height),
                          x:min(x + tile_size, width)]
-            logits = model(crop.to(device, dtype=torch.float32)).float().cpu()
+            outputs = model(crop.to(device, dtype=torch.float32))
+            if isinstance(outputs, (tuple, list)):
+                logits = outputs[0].float().cpu()
+                restored = outputs[-1].float().cpu()
+            else:
+                logits = outputs.float().cpu()
+                restored = None
             crop_h, crop_w = logits.shape[-2:]
             if logits_sum is None:
                 logits_sum = torch.zeros(
                     (1, logits.shape[1], height, width), dtype=torch.float32
                 )
+                if restored is not None:
+                    restored_sum = torch.zeros(
+                        (1, 3, height, width), dtype=torch.float32
+                    )
             key = (crop_h, crop_w)
             if key not in window_cache:
                 wy = torch.hann_window(crop_h, periodic=False)
@@ -261,8 +288,41 @@ def predict_page(model, image, device, tile_size, overlap):
                 window_cache[key] = torch.outer(wy, wx).clamp_min_(0.05)
             weight = window_cache[key]
             logits_sum[..., y:y + crop_h, x:x + crop_w] += logits * weight
+            if restored_sum is not None:
+                restored_sum[..., y:y + crop_h, x:x + crop_w] += (
+                    restored * weight
+                )
             weight_sum[y:y + crop_h, x:x + crop_w] += weight
-    return logits_sum / weight_sum.clamp_min_(1e-6)
+    denominator = weight_sum.clamp_min_(1e-6)
+    restored = None if restored_sum is None else restored_sum / denominator
+    return logits_sum / denominator, restored
+
+
+def _new_restoration_stats():
+    return {"absolute": 0.0, "squared": 0.0, "count": 0.0}
+
+
+def _update_restoration_stats(stats, restored, clean, labels, valid):
+    if restored is None or not bool(valid.item() > 0):
+        return
+    mask = (labels == 1).unsqueeze(1).expand(-1, 3, -1, -1)
+    count = float(mask.sum().item())
+    if count == 0:
+        return
+    difference = (restored - clean).float()
+    stats["absolute"] += float(difference.abs()[mask].sum().item())
+    stats["squared"] += float(difference.pow(2)[mask].sum().item())
+    stats["count"] += count
+
+
+def _add_restoration_results(score, stats):
+    if stats["count"] <= 0:
+        return
+    mae = stats["absolute"] / stats["count"]
+    mse = stats["squared"] / stats["count"]
+    score["Restoration Masked MAE"] = mae
+    score["Restoration Masked PSNR"] = -10.0 * np.log10(max(mse, 1e-10))
+    score["Restoration Fidelity"] = max(0.0, 1.0 - mae)
 
 
 @torch.no_grad()
@@ -270,18 +330,32 @@ def validate_sources(model, loaders, device, metrics, tile_size, overlap):
     model.eval()
     metrics.reset()
     source_scores = {}
+    overall_restoration = _new_restoration_stats()
     for source_name, loader in loaders:
         source_metrics = StreamSegMetrics(metrics.n_classes)
-        for images, labels in tqdm(
+        source_restoration = _new_restoration_stats()
+        for images, labels, clean_targets, restoration_valid in tqdm(
             loader, desc="validation/%s" % source_name, leave=False
         ):
-            logits = predict_page(model, images, device, tile_size, overlap)
+            logits, restored = predict_page(model, images, device, tile_size, overlap)
             predictions = logits.argmax(1).cpu().numpy()
             targets = labels.numpy()
             source_metrics.update(targets, predictions)
             metrics.update(targets, predictions)
-        source_scores[source_name] = source_metrics.get_results()
-    return metrics.get_results(), source_scores
+            _update_restoration_stats(
+                source_restoration, restored, clean_targets, labels,
+                restoration_valid,
+            )
+            _update_restoration_stats(
+                overall_restoration, restored, clean_targets, labels,
+                restoration_valid,
+            )
+        source_score = source_metrics.get_results()
+        _add_restoration_results(source_score, source_restoration)
+        source_scores[source_name] = source_score
+    overall_score = metrics.get_results()
+    _add_restoration_results(overall_score, overall_restoration)
+    return overall_score, source_scores
 
 
 def print_validation_scores(overall_score, source_scores, metrics):
@@ -291,11 +365,23 @@ def print_validation_scores(overall_score, source_scores, metrics):
 
 
 def validation_selection_score(source_scores):
-    """Balance handwriting removal and printed-content preservation by domain."""
+    """Balance segmentation and paired clean-target color restoration."""
     values = [score["Erase Quality"] for score in source_scores.values()]
-    value = float(np.nanmean(values))
-    print("validation macro Erase Quality: %.6f" % value)
-    return value
+    erase_quality = float(np.nanmean(values))
+    restoration = [
+        score["Restoration Fidelity"] for score in source_scores.values()
+        if "Restoration Fidelity" in score
+    ]
+    if restoration:
+        restoration_fidelity = float(np.nanmean(restoration))
+        value = float(np.sqrt(erase_quality * restoration_fidelity))
+        print(
+            "validation Joint Quality: %.6f (erase %.6f, restoration %.6f)"
+            % (value, erase_quality, restoration_fidelity)
+        )
+        return value
+    print("validation macro Erase Quality: %.6f" % erase_quality)
+    return erase_quality
 
 
 def _tb_name(name):
@@ -336,7 +422,7 @@ def write_validation_scalars(
         )
     _write_scalar(
         writer,
-        "validation/macro/Erase_Quality",
+        "validation/macro/Selection_Score",
         macro_selection_score,
         iteration,
     )
@@ -375,7 +461,7 @@ def save_checkpoint(
     ema_updates=0,
 ):
     state = {
-        "format_version": 3,
+        "format_version": 4,
         "iteration": iteration,
         "cur_itrs": iteration,
         # Inference and export load model_state by default. When EMA is enabled,
@@ -386,18 +472,20 @@ def save_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "best_score": best_score,
-        "best_score_name": "validation macro Erase Quality",
+        "best_score_name": "validation Joint Quality",
         "model_config": {
             "model": opts.model,
             "num_classes": opts.num_classes,
             "output_stride": opts.output_stride,
             "mean": MEAN,
             "std": STD,
+            "task": "joint_restoration" if opts.model == "joint_eraser" else "segmentation",
         },
         "data_config": {
             "roots": list(opts.data_roots or ["./datasets/data"]),
             "sampling": opts.dataset_sampling,
             "dataset_weights": opts.dataset_weights,
+            "synthetic_restoration_probability": opts.synthetic_restoration_probability,
         },
         "training_config": {
             "loss": opts.loss,
@@ -409,6 +497,12 @@ def save_checkpoint(
             "tversky_gamma": opts.tversky_gamma,
             "boundary_radius": opts.boundary_radius,
             "label_smoothing": opts.label_smoothing,
+            "reconstruction_weight": opts.reconstruction_weight,
+            "ssim_weight": opts.ssim_weight,
+            "edge_weight": opts.edge_weight,
+            "color_weight": opts.color_weight,
+            "identity_weight": opts.identity_weight,
+            "freeze_segmentation_itrs": opts.freeze_segmentation_itrs,
             "ema_decay": None if opts.no_ema else opts.ema_decay,
         },
     }
@@ -416,10 +510,49 @@ def save_checkpoint(
     print("saved: %s" % path)
 
 
+def initialize_joint_from_segmentation(path, model):
+    checkpoint = torch.load(path, map_location="cpu")
+    state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
+    result = utils.unwrap_model(model).load_state_dict(
+        utils.clean_state_dict(state), strict=False
+    )
+    allowed_prefixes = ("restore_half.", "restore_half_out.", "restore_full.")
+    allowed_buffers = {"input_mean", "input_std"}
+    invalid_missing = [
+        key for key in result.missing_keys
+        if key not in allowed_buffers and not key.startswith(allowed_prefixes)
+    ]
+    if invalid_missing or result.unexpected_keys:
+        raise RuntimeError(
+            "segmentation initialization is incompatible; missing=%s unexpected=%s"
+            % (invalid_missing[:10], result.unexpected_keys[:10])
+        )
+    print("initialized joint segmentation trunk: %s" % path)
+
+
+def set_joint_segmentation_trainable(model, trainable):
+    model = utils.unwrap_model(model)
+    restoration_prefixes = ("restore_half.", "restore_half_out.", "restore_full.")
+    for name, parameter in model.named_parameters():
+        if not name.startswith(restoration_prefixes):
+            parameter.requires_grad_(trainable)
+    if not trainable:
+        for name in (
+            "encoder_s2", "encoder_s4", "encoder_s8", "encoder_s16",
+            "encoder_s32", "context", "decode_s16", "decode_s8",
+            "decode_s4", "decode_s2", "classifier",
+        ):
+            getattr(model, name).eval()
+
+
 def main():
     opts = get_argparser().parse_args()
     if opts.output_stride is None:
-        opts.output_stride = 32 if opts.model == "server_eraser" else 16
+        opts.output_stride = 32 if opts.model in {"server_eraser", "joint_eraser"} else 16
+    if (opts.model == "joint_eraser") != (opts.loss == "joint"):
+        raise ValueError("joint_eraser must use --loss joint; other models must not")
+    if opts.ckpt and opts.init_segmentation_ckpt:
+        raise ValueError("--ckpt and --init-segmentation-ckpt are mutually exclusive")
     os.environ["CUDA_VISIBLE_DEVICES"] = opts.gpu_id
     device = resolve_device(opts.device)
     seed_everything(opts.random_seed)
@@ -470,8 +603,15 @@ def main():
                     [len(dataset) for dataset in train_dataset.datasets])),
            opts.dataset_sampling))
 
-    model = build_model(opts, opts.pretrained_backbone and opts.ckpt is None)
+    model = build_model(
+        opts,
+        opts.pretrained_backbone
+        and opts.ckpt is None
+        and opts.init_segmentation_ckpt is None,
+    )
     model.to(device)
+    if opts.init_segmentation_ckpt:
+        initialize_joint_from_segmentation(opts.init_segmentation_ckpt, model)
     if device.type == "cuda" and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
@@ -495,6 +635,11 @@ def main():
         tversky_gamma=opts.tversky_gamma,
         boundary_radius=opts.boundary_radius,
         label_smoothing=opts.label_smoothing,
+        reconstruction_weight=opts.reconstruction_weight,
+        ssim_weight=opts.ssim_weight,
+        edge_weight=opts.edge_weight,
+        color_weight=opts.color_weight,
+        identity_weight=opts.identity_weight,
     ).to(device)
     metrics = StreamSegMetrics(opts.num_classes)
 
@@ -545,16 +690,44 @@ def main():
     running_loss = 0.0
     running_components = {}
     model.train()
+    segmentation_frozen = (
+        opts.model == "joint_eraser"
+        and opts.init_segmentation_ckpt is not None
+        and iteration < opts.freeze_segmentation_itrs
+    )
+    if segmentation_frozen:
+        set_joint_segmentation_trainable(model, False)
+        print(
+            "segmentation trunk frozen until iteration %d"
+            % opts.freeze_segmentation_itrs
+        )
 
     while iteration < opts.total_itrs:
-        for images, labels in train_loader:
+        for images, labels, clean_targets, restoration_valid in train_loader:
             if iteration >= opts.total_itrs:
                 break
+            if segmentation_frozen and iteration >= opts.freeze_segmentation_itrs:
+                set_joint_segmentation_trainable(model, True)
+                model.train()
+                segmentation_frozen = False
+                print("segmentation trunk unfrozen at iteration %d" % iteration)
             images = images.to(device, dtype=torch.float32, non_blocking=True)
             labels = labels.to(device, dtype=torch.long, non_blocking=True)
+            clean_targets = clean_targets.to(
+                device, dtype=torch.float32, non_blocking=True
+            )
+            restoration_valid = restoration_valid.to(
+                device, dtype=torch.float32, non_blocking=True
+            )
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                loss = criterion(model(images), labels)
+                outputs = model(images)
+                if opts.loss == "joint":
+                    loss = criterion(
+                        outputs, labels, clean_targets, restoration_valid, images
+                    )
+                else:
+                    loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), opts.grad_clip)
@@ -619,6 +792,8 @@ def main():
                         ema.updates if ema is not None else 0,
                     )
                 model.train()
+                if segmentation_frozen:
+                    set_joint_segmentation_trainable(model, False)
 
     if writer is not None:
         writer.close()

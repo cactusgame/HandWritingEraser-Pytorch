@@ -184,8 +184,17 @@ def convert_dataset(source, output, val_ratio=0.15, seed=1, overwrite=False,
                 output_stem + images[stem].suffix.lower()
             )
             label_destination = output / "Labels" / (output_stem + ".png")
+            clean_destination = output / "CleanTargets" / (
+                output_stem + erased[stem].suffix.lower()
+            )
             annotation_path = annotations / (stem + ".txt")
-            if resume and image_destination.is_file() and label_destination.is_file():
+            if (
+                resume
+                and image_destination.is_file()
+                and label_destination.is_file()
+            ):
+                if not clean_destination.is_file():
+                    copy_image(erased[stem], clean_destination)
                 with Image.open(label_destination) as saved_label:
                     label = np.asarray(saved_label.convert("L"))
                 if label.size == 0 or label.min() < 0 or label.max() > 2:
@@ -210,6 +219,7 @@ def convert_dataset(source, output, val_ratio=0.15, seed=1, overwrite=False,
             )
 
             copy_image(images[stem], image_destination)
+            copy_image(erased[stem], clean_destination)
             Image.fromarray(label, mode="L").save(
                 label_destination, compress_level=1
             )
@@ -223,6 +233,8 @@ def convert_dataset(source, output, val_ratio=0.15, seed=1, overwrite=False,
         {
             "name": "SCUT-EnsExam",
             "source": str(source.resolve()),
+            "paired_clean_targets": True,
+            "clean_target_directory": "CleanTargets",
             "split_counts": {key: len(value) for key, value in split_stems.items()},
             "class_pixels": {str(key): value for key, value in sorted(class_pixels.items())},
             "annotation_categories": {

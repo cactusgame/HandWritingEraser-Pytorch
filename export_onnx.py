@@ -64,13 +64,15 @@ def load_eager_model(opts):
     return model, config
 
 
-def export_model(model, output, example, opset, dynamic):
+def export_model(model, output, example, opset, dynamic, joint):
+    output_names = ["logits", "candidate", "restored"] if joint else ["logits"]
     dynamic_axes = None
     if dynamic:
         dynamic_axes = {
             "input": {0: "batch", 2: "height", 3: "width"},
-            "logits": {0: "batch", 2: "height", 3: "width"},
         }
+        for name in output_names:
+            dynamic_axes[name] = {0: "batch", 2: "height", 3: "width"}
     torch.onnx.export(
         model,
         example,
@@ -79,7 +81,7 @@ def export_model(model, output, example, opset, dynamic):
         opset_version=opset,
         do_constant_folding=True,
         input_names=["input"],
-        output_names=["logits"],
+        output_names=output_names,
         dynamic_axes=dynamic_axes,
     )
 
@@ -96,7 +98,11 @@ def check_onnx_file(output, config):
     metadata = {
         "model_config": json.dumps(config, ensure_ascii=False),
         "input": "float32 NCHW normalized RGB image",
-        "output": "float32 logits NCHW; argmax channel gives class id 0/1/2",
+        "output": (
+            "logits, clean RGB candidate, and safely blended restored RGB"
+            if config.get("task") == "joint_restoration"
+            else "float32 logits NCHW; argmax channel gives class id 0/1/2"
+        ),
     }
     existing = {item.key: item for item in model.metadata_props}
     for key, value in metadata.items():
@@ -123,9 +129,16 @@ def verify_with_onnxruntime(model, output, examples):
     )
     for example in examples:
         with torch.inference_mode():
-            expected = model(example).cpu().numpy()
-        actual = session.run(["logits"], {"input": example.cpu().numpy()})[0]
-        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-4)
+            expected = model(example)
+        if not isinstance(expected, (tuple, list)):
+            expected = (expected,)
+        actual = session.run(None, {"input": example.cpu().numpy()})
+        if len(actual) != len(expected):
+            raise RuntimeError("ONNX output count differs from eager model")
+        for actual_item, expected_item in zip(actual, expected):
+            np.testing.assert_allclose(
+                actual_item, expected_item.cpu().numpy(), rtol=1e-3, atol=1e-4
+            )
 
 
 def write_sidecar_config(output, config, opts):
@@ -140,12 +153,15 @@ def write_sidecar_config(output, config, opts):
             "color": "RGB",
             "normalization": {"mean": config.get("mean"), "std": config.get("std")},
         },
-        "output": {
-            "name": "logits",
-            "shape": ["N", config["num_classes"], "H", "W"] if not opts.fixed_shape
-            else [1, config["num_classes"], opts.height, opts.width],
-            "postprocess": "argmax over channel dimension; class 1 is handwriting",
-        },
+        "outputs": (
+            [
+                {"name": "logits", "description": "3-class segmentation logits"},
+                {"name": "candidate", "description": "unmasked clean RGB prediction in [0,1]"},
+                {"name": "restored", "description": "final RGB page in [0,1]"},
+            ]
+            if config.get("task") == "joint_restoration"
+            else [{"name": "logits", "description": "3-class segmentation logits"}]
+        ),
     }
     sidecar.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return sidecar
@@ -160,7 +176,14 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with torch.inference_mode():
-        export_model(model, output, example, opts.opset, not opts.fixed_shape)
+        export_model(
+            model,
+            output,
+            example,
+            opts.opset,
+            not opts.fixed_shape,
+            config.get("task") == "joint_restoration",
+        )
     check_onnx_file(output, config)
     if not opts.no_verify:
         examples = [example]

@@ -116,6 +116,7 @@ def predict_tiled(model, image, device, config, tile_size, overlap, batch_size):
     coordinates = [(y, x) for y in ys for x in xs]
     num_classes = int(config.get("num_classes", 3))
     logits_sum = np.zeros((num_classes, height, width), dtype=np.float32)
+    restored_sum = None
     weight_sum = np.zeros((height, width), dtype=np.float32)
     mean, std = config.get("mean", DEFAULT_MEAN), config.get("std", DEFAULT_STD)
 
@@ -127,13 +128,31 @@ def predict_tiled(model, image, device, config, tile_size, overlap, batch_size):
             tensors.append(image_to_tensor(crop, mean, std))
         # All tiles share a shape except when the complete page is smaller than a tile.
         batch = torch.stack(tensors).to(device)
-        batch_logits = model(batch).float().cpu().numpy()
-        for logits, (y, x) in zip(batch_logits, batch_coords):
+        outputs = model(batch)
+        if isinstance(outputs, (tuple, list)):
+            batch_logits = outputs[0].float().cpu().numpy()
+            batch_restored = outputs[-1].float().cpu().numpy()
+            if restored_sum is None:
+                restored_sum = np.zeros((3, height, width), dtype=np.float32)
+        else:
+            batch_logits = outputs.float().cpu().numpy()
+            batch_restored = [None] * len(batch_coords)
+        for logits, restored, (y, x) in zip(
+            batch_logits, batch_restored, batch_coords
+        ):
             h, w = logits.shape[-2:]
             weight = blend_window(h, w)
             logits_sum[:, y:y + h, x:x + w] += logits * weight[None]
+            if restored_sum is not None:
+                restored_sum[:, y:y + h, x:x + w] += restored * weight[None]
             weight_sum[y:y + h, x:x + w] += weight
-    return np.argmax(logits_sum / np.maximum(weight_sum, 1e-6), axis=0).astype(np.uint8)
+    denominator = np.maximum(weight_sum, 1e-6)
+    labels = np.argmax(logits_sum / denominator, axis=0).astype(np.uint8)
+    if restored_sum is None:
+        return labels, None
+    restored = np.clip(restored_sum / denominator[None], 0.0, 1.0)
+    restored = (restored.transpose(1, 2, 0) * 255.0).round().astype(np.uint8)
+    return labels, Image.fromarray(restored)
 
 
 def erase_handwriting(image, labels, handwriting_class=1, dilate=1):
@@ -188,13 +207,19 @@ def main():
 
     for source in tqdm(files):
         image = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
-        labels = predict_tiled(
+        labels, restored = predict_tiled(
             model, image, device, config, opts.tile_size, opts.overlap,
             opts.tile_batch_size,
         )
-        result, mask = erase_handwriting(
-            image, labels, opts.handwriting_class, opts.dilate
-        )
+        if restored is None:
+            result, mask = erase_handwriting(
+                image, labels, opts.handwriting_class, opts.dilate
+            )
+        else:
+            result = restored
+            mask = Image.fromarray(
+                (labels == opts.handwriting_class).astype(np.uint8) * 255
+            )
         destination = output_path_for(
             source, input_root, opts.output, len(files) > 1
         )

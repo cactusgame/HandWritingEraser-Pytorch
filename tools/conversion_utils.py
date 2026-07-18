@@ -27,7 +27,12 @@ def index_by_stem(directory):
 
 def prepare_output(output_root, overwrite=False, resume=False):
     output_root = Path(output_root)
-    managed = [output_root / "Images", output_root / "Labels", output_root / "splits"]
+    managed = [
+        output_root / "Images",
+        output_root / "Labels",
+        output_root / "CleanTargets",
+        output_root / "splits",
+    ]
     if output_root.exists() and any(path.exists() for path in managed):
         if resume:
             for path in managed:

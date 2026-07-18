@@ -5,6 +5,7 @@ from .loss import (
     FocalLoss,
     HandwritingBoundaryLoss,
     HybridSegmentationLoss,
+    JointRestorationLoss,
     SoftDiceLoss,
     SoftTverskyLoss,
     StructureAwareLoss,

@@ -130,6 +130,7 @@ def convert_dataset(source, output, overlap_policy="handwriting", overwrite=Fals
         {
             "name": "SignaTR6K",
             "source": str(source.resolve()),
+            "paired_clean_targets": False,
             "split_counts": {key: len(value) for key, value in split_stems.items()},
             "class_pixels": {str(key): value for key, value in sorted(class_pixels.items())},
             "source_color_mapping": {

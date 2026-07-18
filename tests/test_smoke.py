@@ -8,13 +8,22 @@ from PIL import Image
 
 import network
 from main import write_validation_scalars
-from datasets import HWSegmentation, MultiSourceHWSegmentation
+from datasets import (
+    HWSegmentation,
+    HWRestorationDataset,
+    JointDocumentTransform,
+    MultiSourceHWSegmentation,
+)
 from predict import tile_starts
 from tools.convert_scut_ensexam import make_three_class_label
 from tools.convert_signatr6k import convert_mask
 from utils.ext_transforms import ExtEnsureMinSize
 from utils import ModelEMA
-from utils.loss import HybridSegmentationLoss, StructureAwareLoss
+from utils.loss import (
+    HybridSegmentationLoss,
+    JointRestorationLoss,
+    StructureAwareLoss,
+)
 
 
 class UpgradeSmokeTests(unittest.TestCase):
@@ -62,6 +71,52 @@ class UpgradeSmokeTests(unittest.TestCase):
         ema.update(model)
         self.assertFalse(torch.equal(before, ema.module.weight))
         self.assertFalse(any(p.requires_grad for p in ema.module.parameters()))
+
+    def test_joint_model_restores_rgb_and_backpropagates(self):
+        model = network.modeling.joint_eraser(
+            num_classes=3, output_stride=32, pretrained_backbone=False
+        )
+        inputs = torch.randn(2, 3, 65, 83)
+        labels = torch.randint(0, 3, (2, 65, 83))
+        clean = torch.rand(2, 3, 65, 83)
+        valid = torch.tensor([1.0, 0.0])
+        outputs = model(inputs)
+        self.assertEqual(len(outputs), 3)
+        self.assertTrue(all(tuple(item.shape[-2:]) == (65, 83) for item in outputs))
+        self.assertTrue(torch.all((outputs[-1] >= 0) & (outputs[-1] <= 1)))
+        criterion = JointRestorationLoss([1, 3, 2])
+        loss = criterion(outputs, labels, clean, valid, inputs)
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("reconstruction", criterion.last_components)
+
+    def test_restoration_dataset_reads_paired_clean_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("Images", "Labels", "CleanTargets"):
+                (root / name).mkdir()
+            for index in range(2):
+                stem = str(index)
+                Image.new("RGB", (40, 32), (230, 225, 220)).save(
+                    root / "Images" / (stem + ".png")
+                )
+                label = np.zeros((32, 40), dtype=np.uint8)
+                label[8:12, 10:25] = 1
+                Image.fromarray(label).save(root / "Labels" / (stem + ".png"))
+                Image.new("RGB", (40, 32), (245, 240, 235)).save(
+                    root / "CleanTargets" / (stem + ".png")
+                )
+            dataset = HWRestorationDataset(
+                root,
+                transform=JointDocumentTransform(32, train=False),
+                split="train",
+                val_ratio=0.5,
+            )
+            image, label, clean, valid = dataset[0]
+            self.assertEqual(tuple(image.shape), (3, 32, 40))
+            self.assertEqual(tuple(clean.shape), (3, 32, 40))
+            self.assertEqual(tuple(label.shape), (32, 40))
+            self.assertEqual(float(valid), 1.0)
 
     def test_tiles_cover_the_last_pixel(self):
         starts = tile_starts(1500, 768, 128)

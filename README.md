@@ -1,6 +1,18 @@
-# HandWriting Eraser 3.0
+# HandWriting Eraser 4.0
 
-这是一个把试卷像素分成 `背景(0) / 手写(1) / 印刷(2)` 三类，并将手写区域擦除为白色的语义分割项目。3.0 的默认模型以 4–8 核 CPU 服务端为目标，精度优先但不依赖 GPU、手机 NPU 或特殊算子；同时保留轻量模型和旧 DeepLabV3+ 入口，便于做速度/精度对照。
+这是一个面向 4–8 核 CPU 服务端的试卷去手写项目。4.0 默认使用单个 `joint_eraser` 模型，同时完成 `背景/手写/印刷` 分割和被遮挡印刷内容的 RGB 修复；输出使用模型内部 soft mask 融合，未检测为手写的区域严格保留输入像素。旧分割模型仍然保留，便于兼容已有 checkpoint。
+
+## 4.0：一个模型完成检测、擦除和补齐
+
+`joint_eraser` 共享 `server_eraser` 的 ResNet-18 编码器和多尺度解码特征，内部包含两个联合训练的输出头：分割头产生手写概率，修复头预测干净 RGB residual。它们属于同一个 checkpoint、一次前向和一个 ONNX/TorchScript 文件，不是串行调用两个模型。
+
+```text
+RGB -> shared encoder/decoder -> segmentation logits
+                         └-----> clean RGB candidate
+input * (1-soft mask) + candidate * soft mask -> restored RGB
+```
+
+修复目标直接使用配对干净图的 RGB，因此可以学习纸张、印刷文字、表格线原本的黑色、灰色或彩色，而不是统一填白。完全被遮挡的信息仍只能根据上下文推断；如果业务能够取得同版空白试卷，模板配准仍然比生成式修复更可靠。
 
 ## 为什么升级
 
@@ -27,6 +39,7 @@
 | 新 `lite_eraser` | 1.92 M | 7.3 MiB | 约 98 ms |
 | 新 `quality_eraser` | 1.96 M | 7.5 MiB | 约 206 ms |
 | 新 `server_eraser` | 11.52 M | 44.0 MiB | 约 331 ms |
+| 新 `joint_eraser` | 11.53 M | 44.0 MiB | 约 419 ms |
 
 延迟是在当前 x86_64 机器、PyTorch 2.2.2 上预热后测得，只用于量级对比。模型精度仍需在完整数据集上重新训练并以独立验证集评估；仓库内没有附带原始训练图片和标签，因此本次升级不虚构精度结果。
 
@@ -47,6 +60,8 @@ loss = class-weighted CE
 ```
 
 `beta > alpha` 让漏擦比误擦受到更大惩罚；边界带 BCE 专门约束笔画内外两侧，减少断笔和边缘残留。默认类别权重为 `1,3,2`：抽样统计中 Baidu/SCUT 的手写像素约占 2.6%–3.1%，但前景裁剪已经显著提高其训练出现率，所以不再用过大的手写权重。最佳 checkpoint 按各数据源 `sqrt(Handwriting IoU × Print IoU)` 的宏平均保存，防止靠误擦印刷内容换取手写召回。
+
+联合模型在上述分割 loss 之外增加 Mask 内 Charbonnier RGB、SSIM、Sobel 边缘和颜色差 loss，并在 Mask 外使用 identity loss。真实或可靠合成的配对样本参与全部修复项；无干净目标样本只参与分割和 Mask 外不变约束，不会把涂白伪结果当成真值。
 
 ### 3. 原训练方法的问题
 
@@ -87,11 +102,11 @@ datasets/data/
 
 ### 转换新增数据集
 
-两个转换器都生成相同的标准结构：`Images/`、`Labels/`、`splits/` 和 `dataset.json`。默认输出不会修改原始数据，也不会静默覆盖已有结果。
+两个转换器都生成标准结构：`Images/`、`Labels/`、`CleanTargets/`、`splits/` 和 `dataset.json`。默认输出不会修改原始数据，也不会静默覆盖已有结果。
 
 ```bash
-python tools/convert_scut_ensexam.py
-python tools/convert_signatr6k.py
+python tools/convert_scut_ensexam.py --resume
+python tools/convert_signatr6k.py --resume
 ```
 
 转换被中断时可追加 `--resume`，已经完成且标签合法的样本会直接复用；需要从头重建时使用 `--overwrite`，两者不能同时使用。
@@ -101,9 +116,13 @@ python tools/convert_signatr6k.py
 - `/Users/peng/Documents/data/HandWritingData/SCUT-EnsExam-baidu-format`
 - `/Users/peng/Documents/data/HandWritingData/SignaTR6K-baidu-format`
 
-SCUT-EnsExam 的原图和擦除图是对齐图像，转换器在手写四边形内进行成对差分，学生答案和教师批改都映射为手写类；印刷类从擦除图的局部对比度和暗像素提取。相关阈值都可通过 `python tools/convert_scut_ensexam.py --help` 调整。官方 430 张训练页会固定拆出 15% 作为验证集，115 张官方测试页不会进入训练或验证。
+SCUT-EnsExam 的原图和擦除图是对齐图像，转换器会把擦除图复制到 `CleanTargets/`，作为真实 RGB 修复目标；同时在手写四边形内进行成对差分，生成三分类标签。相关阈值都可通过 `python tools/convert_scut_ensexam.py --help` 调整。完整数据的 430 张训练页会固定拆出 15% 作为验证集，115 张官方测试页不会进入训练或验证。
 
 SignaTR6K 的颜色映射为：蓝→背景，绿→手写，红→印刷。黄色表示手写与印刷重叠；为了与 Baidu 的互斥三类标签兼容并保证擦除召回率，默认映射为手写。官方 train/validation/test split 原样保留。
+
+Baidu 和 SignaTR6K 没有与输入严格对应的干净整图，不能把算法涂白结果当作修复真值。训练时它们始终参与分割监督；另外，数据集会在线寻找不含手写的真实印刷区域，再覆盖来自同一数据源的真实笔迹，构造“合成输入/原始干净区域”配对。这样底层印刷文字和颜色仍是真实像素。`--synthetic-restoration-probability` 控制该增强比例，默认 `0.5`。
+
+当前这台开发机上的三份数据是小型样例副本：Baidu 5 张、SCUT train/test 各 5 张、SignaTR6K 每个 split 5 张。它们只适合验证代码；正式训练必须使用服务器上的完整数据。
 
 ## 训练
 
@@ -114,17 +133,21 @@ python main.py \
   --data-root /Users/peng/Documents/data/HandWritingData/baidu \
   --data-root /Users/peng/Documents/data/HandWritingData/SCUT-EnsExam-baidu-format \
   --data-root /Users/peng/Documents/data/HandWritingData/SignaTR6K-baidu-format \
-  --model server_eraser \
+  --model joint_eraser \
+  --loss joint \
   --output-stride 32 \
+  --init-segmentation-ckpt /Users/peng/Documents/models/hw_clear/cpu_v2/best.pth \
   --dataset-sampling balanced \
+  --dataset-weights 1,2,1 \
   --batch-size 4 \
   --crop-size 640 \
-  --total-itrs 60000
+  --total-itrs 60000 \
+  --checkpoint-dir /Users/peng/Documents/models/hw_clear/cpu_v3_joint
 ```
 
-如果 CPU 延迟比最高精度更重要，把模型换成 `quality_eraser --output-stride 16`；已有的 2.0 `lite_eraser` checkpoint 仍可直接推理，但不能直接加载到新结构继续训练。
+`cpu_v2/best.pth` 的编码器、分割解码器和分类头会严格加载到联合模型。默认前 2000 iterations 冻结这些权重，只训练修复头；随后自动解冻并用 backbone 小学习率联合微调。`--dataset-weights 1,2,1` 提高真实 SCUT 配对数据的比例。
 
-`--data-root` 可以重复任意次数。默认 `balanced` 让每个数据集获得相同的抽样概率，避免样本最多的 SignaTR6K 主导训练；`--dataset-sampling proportional` 恢复按样本数混合，`--dataset-weights 2,1,1` 可自定义三个数据源的相对概率。验证时会分别打印每个数据集及总集合的指标，最佳模型按各数据集 `Erase Quality` 的宏平均保存，避免高分辨率 SCUT 页面仅凭像素数主导模型选择，也同时约束印刷内容保留率。
+`--data-root` 可以重复任意次数。验证会记录分割指标以及真实配对样本上的 `Restoration Masked MAE/PSNR/Fidelity`。最佳模型按 `sqrt(macro Erase Quality × Restoration Fidelity)` 保存，同时约束手写检测、印刷内容保留和原色修复。
 
 验证指标也会写入本地 TensorBoard event 文件，默认目录是 `<checkpoint-dir>/runs`。只会写本地文件，不会上传到网络。查看方式：
 
@@ -154,7 +177,7 @@ python main.py --data-root datasets/data \
 
 ## CPU 推理
 
-新推理程序使用重叠 tile 的 logits 加权融合，不会像旧版覆盖式拼接那样在 tile 边缘产生明显接缝。默认设备就是 CPU：
+推理程序会同时对分割 logits 和最终修复 RGB 做重叠 tile 加权融合，避免 tile 边缘出现颜色接缝。默认设备就是 CPU：
 
 ```bash
 python predict.py \
@@ -162,8 +185,9 @@ python predict.py \
   --output results/output.png \
   --checkpoint checkpoints/best.pth \
   --device cpu \
-  --tile-size 768 \
-  --overlap 128
+  --threads 4 \
+  --tile-size 512 \
+  --overlap 96
 ```
 
 目录可作为输入和输出，目录层级会保留。`--save-mask` 可同时保存手写 mask，`--threads` 控制 CPU 线程数。
@@ -188,17 +212,17 @@ python predict.py \
 
 ### 导出 ONNX
 
-手机端部署建议优先评估 ONNX Runtime Mobile。导出的 ONNX 输入是已经完成 RGB、归一化后的 `float32 NCHW` 张量，输出是 3 类 logits，通道维 `argmax` 后得到类别 id，其中 `1` 是手写。
+导出的 ONNX 输入是已完成 RGB、ImageNet 归一化的 `float32 NCHW` 张量。联合模型包含三个输出：`logits`、未遮罩的 `candidate` 和可以直接保存为图片的 `restored`；后两个输出为 `[0,1]` RGB。
 
 ```bash
 python export_onnx.py \
-  --checkpoint /Users/peng/Documents/models/hw_clear/cpu_v1/best.pth \
-  --output /Users/peng/Documents/models/hw_clear/cpu_v1/best.onnx \
+  --checkpoint /Users/peng/Documents/models/hw_clear/cpu_v3_joint/best.pth \
+  --output /Users/peng/Documents/models/hw_clear/cpu_v3_joint/best.onnx \
   --height 512 \
   --width 512
 ```
 
-默认导出动态 batch/height/width，并用 ONNX Runtime 在 CPU 上校验 512×512 和另一个非方形尺寸；如果手机端框架要求固定输入尺寸，可加 `--fixed-shape`。
+默认导出动态 batch/height/width，并用 ONNX Runtime CPU 对全部三个输出进行数值校验；需要固定输入尺寸时可加 `--fixed-shape`。
 
 ## 旧模型兼容说明
 
