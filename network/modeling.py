@@ -5,6 +5,7 @@ from .backbone import mobilenetv2
 from .backbone import hrnetv2
 from .lite_eraser import lite_eraser, quality_eraser, server_eraser
 from .joint_eraser import joint_eraser
+from .layered_eraser import layered_eraser
 
 
 def _segm_hrnet(name, backbone_name, num_classes, pretrained_backbone):

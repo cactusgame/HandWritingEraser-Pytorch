@@ -6,6 +6,7 @@ from .loss import (
     HandwritingBoundaryLoss,
     HybridSegmentationLoss,
     JointRestorationLoss,
+    LayeredRestorationLoss,
     SoftDiceLoss,
     SoftTverskyLoss,
     StructureAwareLoss,

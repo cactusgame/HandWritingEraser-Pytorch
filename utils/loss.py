@@ -401,6 +401,161 @@ class JointRestorationLoss(nn.Module):
         return total
 
 
+class LayeredRestorationLoss(JointRestorationLoss):
+    """Separate paper-only restoration from hand-over-print restoration."""
+
+    def __init__(
+        self,
+        class_weights=None,
+        segmentation_weight=1.0,
+        print_structure_weight=1.5,
+        background_weight=2.0,
+        background_low_frequency_weight=0.5,
+        overlap_weight=8.0,
+        overlap_ssim_weight=1.0,
+        overlap_edge_weight=2.0,
+        composition_weight=1.0,
+        identity_weight=0.5,
+        **segmentation_options,
+    ):
+        super().__init__(
+            class_weights=class_weights,
+            segmentation_weight=segmentation_weight,
+            reconstruction_weight=0.0,
+            ssim_weight=0.0,
+            edge_weight=0.0,
+            color_weight=0.0,
+            identity_weight=identity_weight,
+            **segmentation_options,
+        )
+        self.print_structure_weight = print_structure_weight
+        self.background_weight = background_weight
+        self.background_low_frequency_weight = background_low_frequency_weight
+        self.overlap_weight = overlap_weight
+        self.overlap_ssim_weight = overlap_ssim_weight
+        self.overlap_edge_weight = overlap_edge_weight
+        self.composition_weight = composition_weight
+
+    def _print_structure_loss(self, logits, target, valid):
+        target = target.unsqueeze(1).to(logits.dtype)
+        positive_weight = 1.0 + target * 4.0
+        bce = F.binary_cross_entropy_with_logits(
+            logits, target, reduction="none"
+        )
+        bce = self._masked_mean(bce * positive_weight, valid)
+        probability = torch.sigmoid(logits)
+        intersection = (probability * target * valid).sum()
+        denominator = (
+            (probability * valid).sum() + (target * valid).sum()
+        ).clamp_min(1.0)
+        dice = 1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
+        return bce + dice
+
+    def forward(
+        self,
+        outputs,
+        labels,
+        clean_targets,
+        clean_print_masks,
+        restoration_valid,
+        inputs,
+    ):
+        (
+            segmentation_logits,
+            print_logits,
+            candidate,
+            restored,
+        ) = outputs
+        segmentation = self.segmentation(segmentation_logits, labels)
+        candidate = candidate.float()
+        restored = restored.float()
+        clean_targets = clean_targets.float()
+        clean_print_masks = clean_print_masks.float()
+        inputs = inputs.float()
+        raw_rgb = (
+            inputs * self.input_std + self.input_mean
+        ).clamp(0.0, 1.0)
+
+        hand = (labels == 1).to(candidate.dtype).unsqueeze(1)
+        paired = restoration_valid.to(candidate.dtype).view(-1, 1, 1, 1)
+        clean_print = clean_print_masks.unsqueeze(1).to(candidate.dtype)
+        overlap = hand * clean_print * paired
+        hand_background = hand * (1.0 - clean_print) * paired
+        all_hand_paired = hand * paired
+
+        # Visible print/background is supervised for every source.  The
+        # occluded area is only valid when a true or synthetic clean pair exists.
+        print_valid = ((1.0 - hand) + hand * paired).clamp(0.0, 1.0)
+        print_structure = self._print_structure_loss(
+            print_logits.float(), clean_print_masks, print_valid
+        )
+
+        difference = torch.sqrt(
+            (candidate - clean_targets).pow(2) + 1e-6
+        )
+        if torch.any(hand_background > 0):
+            background = self._masked_mean(difference, hand_background)
+            candidate_low = F.avg_pool2d(
+                candidate, 9, stride=1, padding=4
+            )
+            target_low = F.avg_pool2d(
+                clean_targets, 9, stride=1, padding=4
+            )
+            background_low = self._masked_mean(
+                (candidate_low - target_low).abs(), hand_background
+            )
+        else:
+            zero = candidate.sum() * 0.0
+            background = background_low = zero
+
+        if torch.any(overlap > 0):
+            overlap_reconstruction = self._masked_mean(difference, overlap)
+            overlap_ssim = self._ssim_loss(
+                candidate, clean_targets, overlap
+            )
+            overlap_edge = self._edge_loss(
+                candidate, clean_targets, overlap
+            )
+        else:
+            zero = candidate.sum() * 0.0
+            overlap_reconstruction = overlap_ssim = overlap_edge = zero
+
+        if torch.any(all_hand_paired > 0):
+            composition = self._masked_mean(
+                (restored - clean_targets).abs(), all_hand_paired
+            )
+        else:
+            composition = candidate.sum() * 0.0
+        outside = 1.0 - hand
+        identity = self._masked_mean(
+            (restored - raw_rgb).abs(), outside
+        )
+
+        total = (
+            self.segmentation_weight * segmentation
+            + self.print_structure_weight * print_structure
+            + self.background_weight * background
+            + self.background_low_frequency_weight * background_low
+            + self.overlap_weight * overlap_reconstruction
+            + self.overlap_ssim_weight * overlap_ssim
+            + self.overlap_edge_weight * overlap_edge
+            + self.composition_weight * composition
+            + self.identity_weight * identity
+        )
+        self.last_components = {
+            "segmentation": segmentation.detach(),
+            "print_structure": print_structure.detach(),
+            "background": background.detach(),
+            "background_low_frequency": background_low.detach(),
+            "overlap_reconstruction": overlap_reconstruction.detach(),
+            "overlap_ssim": overlap_ssim.detach(),
+            "overlap_edge": overlap_edge.detach(),
+            "composition": composition.detach(),
+            "identity": identity.detach(),
+        }
+        return total
+
+
 def build_loss(
     name,
     class_weights=None,
@@ -419,7 +574,35 @@ def build_loss(
     edge_weight=0.3,
     color_weight=0.2,
     identity_weight=0.1,
+    print_structure_weight=1.5,
+    background_weight=2.0,
+    background_low_frequency_weight=0.5,
+    overlap_weight=8.0,
+    overlap_ssim_weight=1.0,
+    overlap_edge_weight=2.0,
+    composition_weight=1.0,
 ):
+    if name == "layered":
+        return LayeredRestorationLoss(
+            class_weights=class_weights,
+            segmentation_weight=segmentation_weight,
+            print_structure_weight=print_structure_weight,
+            background_weight=background_weight,
+            background_low_frequency_weight=background_low_frequency_weight,
+            overlap_weight=overlap_weight,
+            overlap_ssim_weight=overlap_ssim_weight,
+            overlap_edge_weight=overlap_edge_weight,
+            composition_weight=composition_weight,
+            identity_weight=identity_weight,
+            tversky_weight=tversky_weight,
+            boundary_weight=boundary_weight,
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+            tversky_gamma=tversky_gamma,
+            boundary_radius=boundary_radius,
+            label_smoothing=label_smoothing,
+            ignore_index=ignore_index,
+        )
     if name == "joint":
         return JointRestorationLoss(
             class_weights=class_weights,

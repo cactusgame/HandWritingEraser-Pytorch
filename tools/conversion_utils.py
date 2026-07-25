@@ -31,6 +31,7 @@ def prepare_output(output_root, overwrite=False, resume=False):
         output_root / "Images",
         output_root / "Labels",
         output_root / "CleanTargets",
+        output_root / "CleanPrintMasks",
         output_root / "splits",
     ]
     if output_root.exists() and any(path.exists() for path in managed):

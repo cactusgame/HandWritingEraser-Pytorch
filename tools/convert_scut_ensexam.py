@@ -100,6 +100,7 @@ def make_three_class_label(
     background_radius=15,
     hand_luma_threshold=10,
     hand_color_threshold=22,
+    return_print_mask=False,
 ):
     # int16 is sufficient for channel differences and substantially reduces
     # peak memory on multi-megapixel pages; rgb_luma promotes before multiply.
@@ -138,6 +139,8 @@ def make_three_class_label(
     label = np.zeros(original_rgb.shape[:2], dtype=np.uint8)
     label[printed] = 2
     label[handwriting] = 1  # Handwriting has priority on overlaps.
+    if return_print_mask:
+        return label, printed.astype(np.uint8)
     return label
 
 
@@ -187,6 +190,9 @@ def convert_dataset(source, output, val_ratio=0.15, seed=1, overwrite=False,
             clean_destination = output / "CleanTargets" / (
                 output_stem + erased[stem].suffix.lower()
             )
+            print_destination = (
+                output / "CleanPrintMasks" / (output_stem + ".png")
+            )
             annotation_path = annotations / (stem + ".txt")
             if (
                 resume
@@ -195,6 +201,19 @@ def convert_dataset(source, output, val_ratio=0.15, seed=1, overwrite=False,
             ):
                 if not clean_destination.is_file():
                     copy_image(erased[stem], clean_destination)
+                if not print_destination.is_file():
+                    original = Image.open(images[stem])
+                    clean = Image.open(erased[stem])
+                    box_mask, _ = load_box_mask(
+                        annotation_path, original.size
+                    )
+                    _, clean_print = make_three_class_label(
+                        original, clean, box_mask,
+                        return_print_mask=True, **thresholds
+                    )
+                    Image.fromarray(clean_print, mode="L").save(
+                        print_destination, compress_level=1
+                    )
                 with Image.open(label_destination) as saved_label:
                     label = np.asarray(saved_label.convert("L"))
                 if label.size == 0 or label.min() < 0 or label.max() > 2:
@@ -214,14 +233,18 @@ def convert_dataset(source, output, val_ratio=0.15, seed=1, overwrite=False,
                 annotation_path, original.size
             )
             annotation_categories.update(categories)
-            label = make_three_class_label(
-                original, clean, box_mask, **thresholds
+            label, clean_print = make_three_class_label(
+                original, clean, box_mask,
+                return_print_mask=True, **thresholds
             )
 
             copy_image(images[stem], image_destination)
             copy_image(erased[stem], clean_destination)
             Image.fromarray(label, mode="L").save(
                 label_destination, compress_level=1
+            )
+            Image.fromarray(clean_print, mode="L").save(
+                print_destination, compress_level=1
             )
             counts = np.bincount(label.ravel(), minlength=3)
             class_pixels.update({index: int(value) for index, value in enumerate(counts)})
@@ -235,6 +258,7 @@ def convert_dataset(source, output, val_ratio=0.15, seed=1, overwrite=False,
             "source": str(source.resolve()),
             "paired_clean_targets": True,
             "clean_target_directory": "CleanTargets",
+            "clean_print_mask_directory": "CleanPrintMasks",
             "split_counts": {key: len(value) for key, value in split_stems.items()},
             "class_pixels": {str(key): value for key, value in sorted(class_pixels.items())},
             "annotation_categories": {

@@ -13,6 +13,31 @@ from .handwriting import HWSegmentation
 from utils.ext_transforms import ExtRandomDocumentDegradation
 
 
+def estimate_clean_print_mask(clean, label):
+    """Estimate amodal print, retaining explicit visible-print annotations.
+
+    Paired data only needs estimation under handwriting; visible print remains
+    authoritative from class 2.  Synthetic data supplies an exact mask instead.
+    """
+    clean_rgb = np.asarray(clean.convert("RGB"), dtype=np.uint8)
+    label_array = np.asarray(label, dtype=np.uint8)
+    gray = (
+        clean_rgb[..., 0].astype(np.float32) * 0.299
+        + clean_rgb[..., 1].astype(np.float32) * 0.587
+        + clean_rgb[..., 2].astype(np.float32) * 0.114
+    ).astype(np.uint8)
+    local_background = np.asarray(
+        Image.fromarray(gray).filter(ImageFilter.MaxFilter(15)),
+        dtype=np.int16,
+    )
+    contrast = (local_background - gray.astype(np.int16)) >= 14
+    dark = gray < 145
+    estimated_overlap = (label_array == 1) & (contrast | dark)
+    return Image.fromarray(
+        ((label_array == 2) | estimated_overlap).astype(np.uint8), mode="L"
+    )
+
+
 class JointDocumentTransform:
     """Apply identical geometry/color changes to input and clean target."""
 
@@ -24,6 +49,7 @@ class JointDocumentTransform:
         train=True,
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
+        color_negative_probability=0.55,
     ):
         self.crop_size = int(crop_size)
         self.scale_range = scale_range
@@ -31,6 +57,7 @@ class JointDocumentTransform:
         self.train = train
         self.mean = mean
         self.std = std
+        self.color_negative_probability = color_negative_probability
         self.degradation = ExtRandomDocumentDegradation(p=0.6)
 
     @staticmethod
@@ -48,7 +75,60 @@ class JointDocumentTransform:
             image, clean = operation(image), operation(clean)
         return image, clean
 
-    def _random_crop(self, image, label, clean):
+    @staticmethod
+    def _color_negative(image, clean, label, clean_print):
+        """Create colored panels and colored print without changing semantics."""
+        image_array = np.asarray(image, dtype=np.float32).copy()
+        clean_array = np.asarray(clean, dtype=np.float32).copy()
+        label_array = np.asarray(label, dtype=np.uint8)
+        print_array = np.asarray(clean_print, dtype=np.uint8) > 0
+        height, width = label_array.shape
+
+        palette = np.asarray(
+            [
+                (188, 218, 194), (244, 226, 161), (191, 218, 239),
+                (231, 197, 210), (210, 207, 232), (224, 215, 190),
+            ],
+            dtype=np.float32,
+        )
+        color = palette[random.randrange(len(palette))]
+        left = random.randint(0, max(0, width - 1))
+        top = random.randint(0, max(0, height - 1))
+        right = random.randint(max(left + 1, width // 3), width)
+        bottom = random.randint(max(top + 1, height // 4), height)
+        alpha = random.uniform(0.18, 0.48)
+        image_array[top:bottom, left:right] = (
+            image_array[top:bottom, left:right] * (1.0 - alpha)
+            + color * alpha
+        )
+        clean_array[top:bottom, left:right] = (
+            clean_array[top:bottom, left:right] * (1.0 - alpha)
+            + color * alpha
+        )
+
+        if random.random() < 0.65:
+            ink_colors = np.asarray(
+                [(22, 54, 145), (145, 35, 45), (25, 105, 76),
+                 (111, 47, 135), (36, 100, 125)],
+                dtype=np.float32,
+            )
+            ink_color = ink_colors[random.randrange(len(ink_colors))]
+            strength = random.uniform(0.55, 0.95)
+            visible_print = label_array == 2
+            image_array[visible_print] = (
+                image_array[visible_print] * (1.0 - strength)
+                + ink_color * strength
+            )
+            clean_array[print_array] = (
+                clean_array[print_array] * (1.0 - strength)
+                + ink_color * strength
+            )
+        return (
+            Image.fromarray(np.clip(image_array, 0, 255).astype(np.uint8)),
+            Image.fromarray(np.clip(clean_array, 0, 255).astype(np.uint8)),
+        )
+
+    def _random_crop(self, image, label, clean, clean_print):
         size = self.crop_size
         width, height = image.size
         pad_w, pad_h = max(0, size - width), max(0, size - height)
@@ -62,6 +142,7 @@ class JointDocumentTransform:
             image = ImageOps.expand(image, padding, fill=(255, 255, 255))
             clean = ImageOps.expand(clean, padding, fill=(255, 255, 255))
             label = ImageOps.expand(label, padding, fill=0)
+            clean_print = ImageOps.expand(clean_print, padding, fill=0)
             width, height = image.size
 
         def candidate():
@@ -70,20 +151,36 @@ class JointDocumentTransform:
             return top, left
 
         top, left = candidate()
+        prefer_overlap = random.random() < 0.65
         if random.random() < self.foreground_probability:
-            for _ in range(10):
+            for _ in range(16):
                 try_top, try_left = candidate()
                 crop = np.asarray(
                     label.crop((try_left, try_top, try_left + size, try_top + size))
                 )
+                print_crop = np.asarray(
+                    clean_print.crop(
+                        (try_left, try_top, try_left + size, try_top + size)
+                    )
+                ) > 0
                 top, left = try_top, try_left
-                if np.count_nonzero(crop == 1) >= size * size * 0.001:
+                hand = crop == 1
+                enough_hand = np.count_nonzero(hand) >= size * size * 0.001
+                enough_overlap = np.count_nonzero(hand & print_crop) >= 8
+                if enough_hand and (enough_overlap or not prefer_overlap):
                     break
         box = (left, top, left + size, top + size)
-        return image.crop(box), label.crop(box), clean.crop(box)
+        return (
+            image.crop(box), label.crop(box), clean.crop(box),
+            clean_print.crop(box),
+        )
 
-    def __call__(self, image, label, clean):
+    def __call__(self, image, label, clean, clean_print):
         if self.train:
+            if random.random() < self.color_negative_probability:
+                image, clean = self._color_negative(
+                    image, clean, label, clean_print
+                )
             image, clean = self._color_pair(image, clean)
             if random.random() < 0.35:
                 angle = random.uniform(-2.0, 2.0)
@@ -94,6 +191,9 @@ class JointDocumentTransform:
                     angle, Image.BILINEAR, fillcolor=(255, 255, 255)
                 )
                 label = label.rotate(angle, Image.NEAREST, fillcolor=0)
+                clean_print = clean_print.rotate(
+                    angle, Image.NEAREST, fillcolor=0
+                )
 
             scale = random.uniform(*self.scale_range)
             width, height = image.size
@@ -102,6 +202,7 @@ class JointDocumentTransform:
             image = image.resize(target, Image.BILINEAR)
             clean = clean.resize(target, Image.BILINEAR)
             label = label.resize(target, Image.NEAREST)
+            clean_print = clean_print.resize(target, Image.NEAREST)
 
             width, height = image.size
             min_scale = max(
@@ -117,7 +218,10 @@ class JointDocumentTransform:
                 image = image.resize(target, Image.BILINEAR)
                 clean = clean.resize(target, Image.BILINEAR)
                 label = label.resize(target, Image.NEAREST)
-            image, label, clean = self._random_crop(image, label, clean)
+                clean_print = clean_print.resize(target, Image.NEAREST)
+            image, label, clean, clean_print = self._random_crop(
+                image, label, clean, clean_print
+            )
             image, _ = self.degradation(image, label)
 
         image_tensor = TF.to_tensor(image)
@@ -126,15 +230,21 @@ class JointDocumentTransform:
         label_tensor = torch.from_numpy(
             np.asarray(label, dtype=np.int64).copy()
         )
-        return image_tensor, label_tensor, clean_tensor
+        print_tensor = torch.from_numpy(
+            (np.asarray(clean_print, dtype=np.uint8) > 0).astype(
+                np.float32, copy=False
+            ).copy()
+        )
+        return image_tensor, label_tensor, clean_tensor, print_tensor
 
 
 class HWRestorationDataset(data.Dataset):
-    """Baidu-format segmentation data with optional paired clean RGB targets.
+    """Baidu-format data with clean RGB and amodal print supervision.
 
     Sources without ``CleanTargets/`` remain useful for segmentation. Their
     clean target is a placeholder and ``restoration_valid`` is zero, so they
-    never contribute to image-reconstruction losses.
+    never contribute to image-reconstruction losses unless a forced-overlap
+    pair is synthesized online.
     """
 
     def __init__(
@@ -155,6 +265,16 @@ class HWRestorationDataset(data.Dataset):
                     if path.stem in self.clean_targets:
                         raise ValueError("duplicate clean target stem: %s" % path.stem)
                     self.clean_targets[path.stem] = path
+        clean_print_dir = self.root / "CleanPrintMasks"
+        self.clean_print_targets = {}
+        if clean_print_dir.is_dir():
+            for path in clean_print_dir.iterdir():
+                if path.is_file() and path.suffix.lower() in self.base.valid_suffixes:
+                    if path.stem in self.clean_print_targets:
+                        raise ValueError(
+                            "duplicate clean print mask stem: %s" % path.stem
+                        )
+                    self.clean_print_targets[path.stem] = path
         self.paired_count = sum(
             image_path.stem in self.clean_targets
             for image_path, _ in self.base.pairs
@@ -268,17 +388,39 @@ class HWRestorationDataset(data.Dataset):
         patch_mask = patch_mask.rotate(angle, Image.NEAREST, expand=True, fillcolor=0)
         if patch.size[0] > clean.size[0] or patch.size[1] > clean.size[1]:
             return None
-        print_coordinates = np.argwhere(np.asarray(clean_label) == 2)
+        clean_print_array = np.asarray(clean_label) == 2
+        print_coordinates = np.argwhere(clean_print_array)
         if not len(print_coordinates):
             return None
-        center_y, center_x = print_coordinates[
-            random.randrange(len(print_coordinates))
-        ]
-        jitter = max(1, patch.size[0] // 4)
-        left = int(center_x - patch.size[0] // 2 + random.randint(-jitter, jitter))
-        top = int(center_y - patch.size[1] // 2 + random.randint(-jitter, jitter))
-        left = max(0, min(clean.size[0] - patch.size[0], left))
-        top = max(0, min(clean.size[1] - patch.size[1], top))
+        patch_mask_array = np.asarray(patch_mask) > 64
+        hand_pixels = max(1, int(patch_mask_array.sum()))
+        best = None
+        for _ in range(24):
+            center_y, center_x = print_coordinates[
+                random.randrange(len(print_coordinates))
+            ]
+            jitter = max(1, patch.size[0] // 6)
+            left = int(
+                center_x - patch.size[0] // 2
+                + random.randint(-jitter, jitter)
+            )
+            top = int(
+                center_y - patch.size[1] // 2
+                + random.randint(-jitter, jitter)
+            )
+            left = max(0, min(clean.size[0] - patch.size[0], left))
+            top = max(0, min(clean.size[1] - patch.size[1], top))
+            print_region = clean_print_array[
+                top:top + patch.size[1], left:left + patch.size[0]
+            ]
+            overlap = int(np.count_nonzero(print_region & patch_mask_array))
+            if best is None or overlap > best[0]:
+                best = (overlap, left, top)
+            if overlap >= max(8, int(round(hand_pixels * 0.12))):
+                break
+        if best is None or best[0] < 8:
+            return None
+        _, left, top = best
 
         alpha = patch_mask.filter(ImageFilter.GaussianBlur(0.5))
         synthetic = clean.copy()
@@ -288,9 +430,12 @@ class HWRestorationDataset(data.Dataset):
             (left, top, left + patch.size[0], top + patch.size[1])
         )
         label_array = np.asarray(label_region, dtype=np.uint8).copy()
-        label_array[np.asarray(patch_mask) > 64] = 1
+        label_array[patch_mask_array] = 1
         new_label.paste(Image.fromarray(label_array), (left, top))
-        return synthetic, new_label, clean
+        clean_print = Image.fromarray(
+            clean_print_array.astype(np.uint8), mode="L"
+        )
+        return synthetic, new_label, clean, clean_print
 
     def __getitem__(self, index):
         image_path, label_path = self.base.pairs[index]
@@ -322,23 +467,48 @@ class HWRestorationDataset(data.Dataset):
                 if synthetic is not None:
                     break
         if synthetic is not None:
-            image, label, clean = synthetic
+            image, label, clean, clean_print = synthetic
             restoration_valid = 1.0
         elif clean_path is None:
             clean = image.copy()
+            clean_print = Image.fromarray(
+                (np.asarray(label, dtype=np.uint8) == 2).astype(np.uint8),
+                mode="L",
+            )
             restoration_valid = 0.0
         else:
             with Image.open(clean_path) as source:
                 clean = source.convert("RGB")
+            clean_print_path = self.clean_print_targets.get(image_path.stem)
+            if clean_print_path is None:
+                clean_print = estimate_clean_print_mask(clean, label)
+            else:
+                with Image.open(clean_print_path) as source:
+                    clean_print = source.convert("L").point(
+                        lambda value: 1 if value > 0 else 0
+                    )
             restoration_valid = 1.0
-        if image.size != label.size or image.size != clean.size:
+        if (
+            image.size != label.size
+            or image.size != clean.size
+            or image.size != clean_print.size
+        ):
             raise ValueError(
-                "joint sample sizes differ for %s: image=%s label=%s clean=%s"
-                % (image_path.name, image.size, label.size, clean.size)
+                "joint sample sizes differ for %s: image=%s label=%s "
+                "clean=%s clean_print=%s"
+                % (
+                    image_path.name, image.size, label.size, clean.size,
+                    clean_print.size,
+                )
             )
         if self.transform is not None:
-            image, label, clean = self.transform(image, label, clean)
-        return image, label, clean, torch.tensor(restoration_valid)
+            image, label, clean, clean_print = self.transform(
+                image, label, clean, clean_print
+            )
+        return (
+            image, label, clean, clean_print,
+            torch.tensor(restoration_valid),
+        )
 
 
 class MultiSourceHWRestoration(data.ConcatDataset):

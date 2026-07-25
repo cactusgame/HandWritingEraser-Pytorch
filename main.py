@@ -39,7 +39,7 @@ def get_argparser():
         and callable(value)
         and (name.startswith("deeplab") or name.endswith("eraser"))
     )
-    parser.add_argument("--model", default="joint_eraser", choices=available_models)
+    parser.add_argument("--model", default="layered_eraser", choices=available_models)
     parser.add_argument(
         "--output-stride", "--output_stride", type=int, default=None,
         choices=[8, 16, 32],
@@ -50,16 +50,21 @@ def get_argparser():
     parser.add_argument("--no-pretrained-backbone", dest="pretrained_backbone", action="store_false")
     parser.set_defaults(pretrained_backbone=True)
 
-    parser.add_argument("--total-itrs", "--total_itrs", type=int, default=60000)
-    parser.add_argument("--batch-size", "--batch_size", type=int, default=4)
-    parser.add_argument("--crop-size", "--crop_size", type=int, default=640)
+    parser.add_argument("--total-itrs", "--total_itrs", type=int, default=80000)
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=2)
+    parser.add_argument("--crop-size", "--crop_size", type=int, default=512)
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--backbone-lr-mult", type=float, default=0.25)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-itrs", type=int, default=1000)
-    parser.add_argument("--loss", "--loss_type", default="joint",
-                        choices=["joint", "structure", "hybrid", "focal", "cross_entropy"])
+    parser.add_argument(
+        "--loss", "--loss_type", default="layered",
+        choices=[
+            "layered", "joint", "structure", "hybrid", "focal",
+            "cross_entropy",
+        ],
+    )
     parser.add_argument("--class-weights", default="1,3,2",
                         help="background,handwriting,print weights")
     parser.add_argument("--dice-weight", type=float, default=0.5)
@@ -76,14 +81,27 @@ def get_argparser():
     parser.add_argument("--ssim-weight", type=float, default=0.4)
     parser.add_argument("--edge-weight", type=float, default=0.3)
     parser.add_argument("--color-weight", type=float, default=0.2)
-    parser.add_argument("--identity-weight", type=float, default=0.1)
+    parser.add_argument("--identity-weight", type=float, default=0.5)
+    parser.add_argument("--print-structure-weight", type=float, default=1.5)
+    parser.add_argument("--background-weight", type=float, default=2.0)
+    parser.add_argument(
+        "--background-low-frequency-weight", type=float, default=0.5
+    )
+    parser.add_argument("--overlap-weight", type=float, default=8.0)
+    parser.add_argument("--overlap-ssim-weight", type=float, default=1.0)
+    parser.add_argument("--overlap-edge-weight", type=float, default=2.0)
+    parser.add_argument("--composition-weight", type=float, default=1.0)
     parser.add_argument(
         "--freeze-segmentation-itrs", type=int, default=2000,
         help="when initializing from cpu_v2, train only restoration heads first",
     )
     parser.add_argument(
-        "--synthetic-restoration-probability", type=float, default=0.5,
+        "--synthetic-restoration-probability", type=float, default=0.85,
         help="for unpaired sources, probability of overlaying real ink onto a clean region",
+    )
+    parser.add_argument(
+        "--color-negative-probability", type=float, default=0.55,
+        help="probability of colored paper/print negative augmentation",
     )
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--ema-decay", type=float, default=0.999)
@@ -169,7 +187,8 @@ def parse_dataset_weights(value, count):
 
 def get_datasets(opts):
     train_transform = JointDocumentTransform(
-        crop_size=opts.crop_size, train=True, mean=MEAN, std=STD
+        crop_size=opts.crop_size, train=True, mean=MEAN, std=STD,
+        color_negative_probability=opts.color_negative_probability,
     )
     eval_transform = JointDocumentTransform(
         crop_size=opts.crop_size, train=False, mean=MEAN, std=STD
@@ -245,19 +264,25 @@ def tile_starts(length, tile_size, overlap):
 
 @torch.no_grad()
 def predict_page(model, image, device, tile_size, overlap):
-    """Return CPU logits and optional restored RGB using overlap tiling."""
+    """Return CPU segmentation, optional print logits, and restored RGB."""
     if tile_size <= 0 or overlap < 0 or overlap >= tile_size:
         raise ValueError("validation needs 0 <= overlap < tile-size")
     height, width = image.shape[-2:]
     if height <= tile_size and width <= tile_size:
         outputs = model(image.to(device, dtype=torch.float32))
         if isinstance(outputs, (tuple, list)):
-            return outputs[0].float().cpu(), outputs[-1].float().cpu()
-        return outputs.float().cpu(), None
+            print_logits = outputs[1] if len(outputs) == 4 else None
+            return (
+                outputs[0].float().cpu(),
+                None if print_logits is None else print_logits.float().cpu(),
+                outputs[-1].float().cpu(),
+            )
+        return outputs.float().cpu(), None, None
 
     ys = tile_starts(height, tile_size, overlap)
     xs = tile_starts(width, tile_size, overlap)
     logits_sum = None
+    print_sum = None
     restored_sum = None
     weight_sum = torch.zeros((height, width), dtype=torch.float32)
     window_cache = {}
@@ -268,9 +293,13 @@ def predict_page(model, image, device, tile_size, overlap):
             outputs = model(crop.to(device, dtype=torch.float32))
             if isinstance(outputs, (tuple, list)):
                 logits = outputs[0].float().cpu()
+                print_logits = (
+                    outputs[1].float().cpu() if len(outputs) == 4 else None
+                )
                 restored = outputs[-1].float().cpu()
             else:
                 logits = outputs.float().cpu()
+                print_logits = None
                 restored = None
             crop_h, crop_w = logits.shape[-2:]
             if logits_sum is None:
@@ -280,6 +309,10 @@ def predict_page(model, image, device, tile_size, overlap):
                 if restored is not None:
                     restored_sum = torch.zeros(
                         (1, 3, height, width), dtype=torch.float32
+                    )
+                if print_logits is not None:
+                    print_sum = torch.zeros(
+                        (1, 1, height, width), dtype=torch.float32
                     )
             key = (crop_h, crop_w)
             if key not in window_cache:
@@ -292,20 +325,35 @@ def predict_page(model, image, device, tile_size, overlap):
                 restored_sum[..., y:y + crop_h, x:x + crop_w] += (
                     restored * weight
                 )
+            if print_sum is not None:
+                print_sum[..., y:y + crop_h, x:x + crop_w] += (
+                    print_logits * weight
+                )
             weight_sum[y:y + crop_h, x:x + crop_w] += weight
     denominator = weight_sum.clamp_min_(1e-6)
     restored = None if restored_sum is None else restored_sum / denominator
-    return logits_sum / denominator, restored
+    print_logits = None if print_sum is None else print_sum / denominator
+    return logits_sum / denominator, print_logits, restored
 
 
 def _new_restoration_stats():
-    return {"absolute": 0.0, "squared": 0.0, "count": 0.0}
+    return {
+        "absolute": 0.0, "squared": 0.0, "count": 0.0,
+        "background_absolute": 0.0, "background_count": 0.0,
+        "overlap_absolute": 0.0, "overlap_squared": 0.0,
+        "overlap_count": 0.0,
+        "print_tp": 0.0, "print_fp": 0.0, "print_fn": 0.0,
+    }
 
 
-def _update_restoration_stats(stats, restored, clean, labels, valid):
+def _update_restoration_stats(
+    stats, restored, print_logits, clean, labels, clean_print, valid
+):
     if restored is None or not bool(valid.item() > 0):
         return
-    mask = (labels == 1).unsqueeze(1).expand(-1, 3, -1, -1)
+    hand = labels == 1
+    print_target = clean_print > 0.5
+    mask = hand.unsqueeze(1).expand(-1, 3, -1, -1)
     count = float(mask.sum().item())
     if count == 0:
         return
@@ -313,6 +361,36 @@ def _update_restoration_stats(stats, restored, clean, labels, valid):
     stats["absolute"] += float(difference.abs()[mask].sum().item())
     stats["squared"] += float(difference.pow(2)[mask].sum().item())
     stats["count"] += count
+    background_mask = (
+        hand & ~print_target
+    ).unsqueeze(1).expand(-1, 3, -1, -1)
+    overlap_mask = (
+        hand & print_target
+    ).unsqueeze(1).expand(-1, 3, -1, -1)
+    stats["background_absolute"] += float(
+        difference.abs()[background_mask].sum().item()
+    )
+    stats["background_count"] += float(background_mask.sum().item())
+    stats["overlap_absolute"] += float(
+        difference.abs()[overlap_mask].sum().item()
+    )
+    stats["overlap_squared"] += float(
+        difference.pow(2)[overlap_mask].sum().item()
+    )
+    stats["overlap_count"] += float(overlap_mask.sum().item())
+    if print_logits is not None:
+        predicted_print = torch.sigmoid(print_logits) >= 0.5
+        target = print_target.unsqueeze(1)
+        valid_hand = hand.unsqueeze(1)
+        stats["print_tp"] += float(
+            (predicted_print & target & valid_hand).sum().item()
+        )
+        stats["print_fp"] += float(
+            (predicted_print & ~target & valid_hand).sum().item()
+        )
+        stats["print_fn"] += float(
+            (~predicted_print & target & valid_hand).sum().item()
+        )
 
 
 def _add_restoration_results(score, stats):
@@ -323,6 +401,30 @@ def _add_restoration_results(score, stats):
     score["Restoration Masked MAE"] = mae
     score["Restoration Masked PSNR"] = -10.0 * np.log10(max(mse, 1e-10))
     score["Restoration Fidelity"] = max(0.0, 1.0 - mae)
+    if stats["background_count"] > 0:
+        background_mae = (
+            stats["background_absolute"] / stats["background_count"]
+        )
+        score["Background MAE"] = background_mae
+        score["Background Fidelity"] = max(0.0, 1.0 - background_mae)
+    if stats["overlap_count"] > 0:
+        overlap_mae = stats["overlap_absolute"] / stats["overlap_count"]
+        overlap_mse = stats["overlap_squared"] / stats["overlap_count"]
+        score["Overlap MAE"] = overlap_mae
+        score["Overlap PSNR"] = -10.0 * np.log10(
+            max(overlap_mse, 1e-10)
+        )
+        score["Overlap Fidelity"] = max(0.0, 1.0 - overlap_mae)
+    denominator = (
+        2.0 * stats["print_tp"] + stats["print_fp"] + stats["print_fn"]
+    )
+    if denominator > 0:
+        score["Occluded Print F1"] = (
+            2.0 * stats["print_tp"] / denominator
+        )
+        score["Occluded Print Recall"] = stats["print_tp"] / max(
+            stats["print_tp"] + stats["print_fn"], 1.0
+        )
 
 
 @torch.no_grad()
@@ -334,21 +436,26 @@ def validate_sources(model, loaders, device, metrics, tile_size, overlap):
     for source_name, loader in loaders:
         source_metrics = StreamSegMetrics(metrics.n_classes)
         source_restoration = _new_restoration_stats()
-        for images, labels, clean_targets, restoration_valid in tqdm(
+        for (
+            images, labels, clean_targets, clean_print_masks,
+            restoration_valid,
+        ) in tqdm(
             loader, desc="validation/%s" % source_name, leave=False
         ):
-            logits, restored = predict_page(model, images, device, tile_size, overlap)
+            logits, print_logits, restored = predict_page(
+                model, images, device, tile_size, overlap
+            )
             predictions = logits.argmax(1).cpu().numpy()
             targets = labels.numpy()
             source_metrics.update(targets, predictions)
             metrics.update(targets, predictions)
             _update_restoration_stats(
-                source_restoration, restored, clean_targets, labels,
-                restoration_valid,
+                source_restoration, restored, print_logits, clean_targets,
+                labels, clean_print_masks, restoration_valid,
             )
             _update_restoration_stats(
-                overall_restoration, restored, clean_targets, labels,
-                restoration_valid,
+                overall_restoration, restored, print_logits, clean_targets,
+                labels, clean_print_masks, restoration_valid,
             )
         source_score = source_metrics.get_results()
         _add_restoration_results(source_score, source_restoration)
@@ -365,9 +472,39 @@ def print_validation_scores(overall_score, source_scores, metrics):
 
 
 def validation_selection_score(source_scores):
-    """Balance segmentation and paired clean-target color restoration."""
+    """Require segmentation, paper color, and occluded print to improve."""
     values = [score["Erase Quality"] for score in source_scores.values()]
     erase_quality = float(np.nanmean(values))
+    layered_scores = [
+        score for score in source_scores.values()
+        if "Overlap Fidelity" in score
+    ]
+    if layered_scores:
+        background = float(np.nanmean([
+            score.get("Background Fidelity", score["Restoration Fidelity"])
+            for score in layered_scores
+        ]))
+        overlap = float(np.nanmean([
+            score["Overlap Fidelity"] for score in layered_scores
+        ]))
+        print_f1_values = [
+            score["Occluded Print F1"] for score in layered_scores
+            if "Occluded Print F1" in score
+        ]
+        print_f1 = (
+            float(np.nanmean(print_f1_values))
+            if print_f1_values else overlap
+        )
+        value = float(
+            max(erase_quality * background * overlap * print_f1, 0.0)
+            ** 0.25
+        )
+        print(
+            "validation Layered Quality: %.6f "
+            "(erase %.6f, background %.6f, overlap %.6f, print-f1 %.6f)"
+            % (value, erase_quality, background, overlap, print_f1)
+        )
+        return value
     restoration = [
         score["Restoration Fidelity"] for score in source_scores.values()
         if "Restoration Fidelity" in score
@@ -461,7 +598,7 @@ def save_checkpoint(
     ema_updates=0,
 ):
     state = {
-        "format_version": 4,
+        "format_version": 5 if opts.model == "layered_eraser" else 4,
         "iteration": iteration,
         "cur_itrs": iteration,
         # Inference and export load model_state by default. When EMA is enabled,
@@ -472,20 +609,33 @@ def save_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "best_score": best_score,
-        "best_score_name": "validation Joint Quality",
+        "best_score_name": (
+            "validation Layered Quality"
+            if opts.model == "layered_eraser"
+            else "validation Joint Quality"
+        ),
         "model_config": {
             "model": opts.model,
             "num_classes": opts.num_classes,
             "output_stride": opts.output_stride,
             "mean": MEAN,
             "std": STD,
-            "task": "joint_restoration" if opts.model == "joint_eraser" else "segmentation",
+            "task": (
+                "layered_restoration"
+                if opts.model == "layered_eraser"
+                else (
+                    "joint_restoration"
+                    if opts.model == "joint_eraser"
+                    else "segmentation"
+                )
+            ),
         },
         "data_config": {
             "roots": list(opts.data_roots or ["./datasets/data"]),
             "sampling": opts.dataset_sampling,
             "dataset_weights": opts.dataset_weights,
             "synthetic_restoration_probability": opts.synthetic_restoration_probability,
+            "color_negative_probability": opts.color_negative_probability,
         },
         "training_config": {
             "loss": opts.loss,
@@ -502,6 +652,15 @@ def save_checkpoint(
             "edge_weight": opts.edge_weight,
             "color_weight": opts.color_weight,
             "identity_weight": opts.identity_weight,
+            "print_structure_weight": opts.print_structure_weight,
+            "background_weight": opts.background_weight,
+            "background_low_frequency_weight": (
+                opts.background_low_frequency_weight
+            ),
+            "overlap_weight": opts.overlap_weight,
+            "overlap_ssim_weight": opts.overlap_ssim_weight,
+            "overlap_edge_weight": opts.overlap_edge_weight,
+            "composition_weight": opts.composition_weight,
             "freeze_segmentation_itrs": opts.freeze_segmentation_itrs,
             "ema_decay": None if opts.no_ema else opts.ema_decay,
         },
@@ -548,13 +707,40 @@ def set_joint_segmentation_trainable(model, trainable):
 def main():
     opts = get_argparser().parse_args()
     if opts.output_stride is None:
-        opts.output_stride = 32 if opts.model in {"server_eraser", "joint_eraser"} else 16
-    if (opts.model == "joint_eraser") != (opts.loss == "joint"):
-        raise ValueError("joint_eraser must use --loss joint; other models must not")
+        opts.output_stride = (
+            32
+            if opts.model in {
+                "server_eraser", "joint_eraser", "layered_eraser"
+            }
+            else 16
+        )
+    expected_loss = {
+        "joint_eraser": "joint",
+        "layered_eraser": "layered",
+    }.get(opts.model)
+    if expected_loss is not None and opts.loss != expected_loss:
+        raise ValueError(
+            "%s must use --loss %s" % (opts.model, expected_loss)
+        )
+    if expected_loss is None and opts.loss in {"joint", "layered"}:
+        raise ValueError(
+            "--loss %s requires its matching restoration model" % opts.loss
+        )
     if opts.ckpt and opts.init_segmentation_ckpt:
         raise ValueError("--ckpt and --init-segmentation-ckpt are mutually exclusive")
+    if opts.init_segmentation_ckpt and opts.model != "joint_eraser":
+        raise ValueError(
+            "--init-segmentation-ckpt only supports joint_eraser; "
+            "layered_eraser uses an ImageNet-pretrained ResNet-34 backbone"
+        )
+    if not 0.0 <= opts.color_negative_probability <= 1.0:
+        raise ValueError("--color-negative-probability must be in [0, 1]")
     os.environ["CUDA_VISIBLE_DEVICES"] = opts.gpu_id
     device = resolve_device(opts.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     seed_everything(opts.random_seed)
     print("device: %s" % device)
 
@@ -640,6 +826,15 @@ def main():
         edge_weight=opts.edge_weight,
         color_weight=opts.color_weight,
         identity_weight=opts.identity_weight,
+        print_structure_weight=opts.print_structure_weight,
+        background_weight=opts.background_weight,
+        background_low_frequency_weight=(
+            opts.background_low_frequency_weight
+        ),
+        overlap_weight=opts.overlap_weight,
+        overlap_ssim_weight=opts.overlap_ssim_weight,
+        overlap_edge_weight=opts.overlap_edge_weight,
+        composition_weight=opts.composition_weight,
     ).to(device)
     metrics = StreamSegMetrics(opts.num_classes)
 
@@ -703,7 +898,10 @@ def main():
         )
 
     while iteration < opts.total_itrs:
-        for images, labels, clean_targets, restoration_valid in train_loader:
+        for (
+            images, labels, clean_targets, clean_print_masks,
+            restoration_valid,
+        ) in train_loader:
             if iteration >= opts.total_itrs:
                 break
             if segmentation_frozen and iteration >= opts.freeze_segmentation_itrs:
@@ -716,13 +914,21 @@ def main():
             clean_targets = clean_targets.to(
                 device, dtype=torch.float32, non_blocking=True
             )
+            clean_print_masks = clean_print_masks.to(
+                device, dtype=torch.float32, non_blocking=True
+            )
             restoration_valid = restoration_valid.to(
                 device, dtype=torch.float32, non_blocking=True
             )
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
                 outputs = model(images)
-                if opts.loss == "joint":
+                if opts.loss == "layered":
+                    loss = criterion(
+                        outputs, labels, clean_targets, clean_print_masks,
+                        restoration_valid, images,
+                    )
+                elif opts.loss == "joint":
                     loss = criterion(
                         outputs, labels, clean_targets, restoration_valid, images
                     )
@@ -745,17 +951,31 @@ def main():
                 )
             if iteration % opts.print_interval == 0:
                 train_loss = running_loss / opts.print_interval
+                memory_text = ""
+                peak_reserved_gib = None
+                if device.type == "cuda":
+                    peak_reserved_gib = (
+                        torch.cuda.max_memory_reserved() / (1024.0 ** 3)
+                    )
+                    memory_text = "  peak-vram %.2f GiB" % peak_reserved_gib
                 print(
-                    "iteration %d/%d  loss %.5f  lr %.2e"
+                    "iteration %d/%d  loss %.5f  lr %.2e%s"
                     % (iteration, opts.total_itrs,
                        train_loss,
-                       optimizer.param_groups[-1]["lr"])
+                       optimizer.param_groups[-1]["lr"],
+                       memory_text)
                 )
                 if writer is not None:
                     writer.add_scalar("train/loss", train_loss, iteration)
                     writer.add_scalar(
                         "train/lr", optimizer.param_groups[-1]["lr"], iteration
                     )
+                    if peak_reserved_gib is not None:
+                        writer.add_scalar(
+                            "train/peak_vram_gib",
+                            peak_reserved_gib,
+                            iteration,
+                        )
                     for name, value in running_components.items():
                         writer.add_scalar(
                             "train/loss_%s" % name,
@@ -764,6 +984,8 @@ def main():
                         )
                 running_loss = 0.0
                 running_components.clear()
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
 
             if iteration % opts.val_interval == 0 or iteration == opts.total_itrs:
                 score, source_scores = validate_sources(

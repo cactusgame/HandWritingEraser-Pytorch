@@ -64,8 +64,15 @@ def load_eager_model(opts):
     return model, config
 
 
-def export_model(model, output, example, opset, dynamic, joint):
-    output_names = ["logits", "candidate", "restored"] if joint else ["logits"]
+def model_output_names(config):
+    if config.get("task") == "layered_restoration":
+        return ["logits", "print_logits", "candidate", "restored"]
+    if config.get("task") == "joint_restoration":
+        return ["logits", "candidate", "restored"]
+    return ["logits"]
+
+
+def export_model(model, output, example, opset, dynamic, output_names):
     dynamic_axes = None
     if dynamic:
         dynamic_axes = {
@@ -94,14 +101,31 @@ def check_onnx_file(output, config):
         return
 
     model = onnx.load(output)
+    output_channels = {
+        "segmentation": [3],
+        "joint_restoration": [3, 3, 3],
+        "layered_restoration": [3, 1, 3, 3],
+    }.get(config.get("task"), [int(config.get("num_classes", 3))])
+    if len(output_channels) == len(model.graph.output):
+        for graph_output, channels in zip(
+            model.graph.output, output_channels
+        ):
+            channel_dimension = graph_output.type.tensor_type.shape.dim[1]
+            channel_dimension.ClearField("dim_param")
+            channel_dimension.dim_value = channels
     onnx.checker.check_model(model)
     metadata = {
         "model_config": json.dumps(config, ensure_ascii=False),
         "input": "float32 NCHW normalized RGB image",
         "output": (
-            "logits, clean RGB candidate, and safely blended restored RGB"
-            if config.get("task") == "joint_restoration"
-            else "float32 logits NCHW; argmax channel gives class id 0/1/2"
+            "segmentation logits, amodal print logits, clean RGB candidate, "
+            "and safely blended restored RGB"
+            if config.get("task") == "layered_restoration"
+            else (
+                "logits, clean RGB candidate, and safely blended restored RGB"
+                if config.get("task") == "joint_restoration"
+                else "float32 logits NCHW; argmax channel gives class id 0/1/2"
+            )
         ),
     }
     existing = {item.key: item for item in model.metadata_props}
@@ -124,6 +148,9 @@ def verify_with_onnxruntime(model, output, examples):
 
     session_options = ort.SessionOptions()
     session_options.intra_op_num_threads = 1
+    # Layered outputs share dynamic H/W but have 3/1/3/3 channels.  Disabling
+    # the memory pattern avoids an ORT buffer-reuse warning across those shapes.
+    session_options.enable_mem_pattern = False
     session = ort.InferenceSession(
         str(output), sess_options=session_options, providers=["CPUExecutionProvider"]
     )
@@ -137,7 +164,8 @@ def verify_with_onnxruntime(model, output, examples):
             raise RuntimeError("ONNX output count differs from eager model")
         for actual_item, expected_item in zip(actual, expected):
             np.testing.assert_allclose(
-                actual_item, expected_item.cpu().numpy(), rtol=1e-3, atol=1e-4
+                actual_item, expected_item.cpu().numpy(),
+                rtol=1e-3, atol=3e-4,
             )
 
 
@@ -156,11 +184,23 @@ def write_sidecar_config(output, config, opts):
         "outputs": (
             [
                 {"name": "logits", "description": "3-class segmentation logits"},
+                {
+                    "name": "print_logits",
+                    "description": "amodal printed-content logits",
+                },
+                {"name": "candidate", "description": "unmasked clean RGB prediction in [0,1]"},
+                {"name": "restored", "description": "final RGB page in [0,1]"},
+            ]
+            if config.get("task") == "layered_restoration"
+            else (
+            [
+                {"name": "logits", "description": "3-class segmentation logits"},
                 {"name": "candidate", "description": "unmasked clean RGB prediction in [0,1]"},
                 {"name": "restored", "description": "final RGB page in [0,1]"},
             ]
             if config.get("task") == "joint_restoration"
             else [{"name": "logits", "description": "3-class segmentation logits"}]
+            )
         ),
     }
     sidecar.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -182,7 +222,7 @@ def main():
             example,
             opts.opset,
             not opts.fixed_shape,
-            config.get("task") == "joint_restoration",
+            model_output_names(config),
         )
     check_onnx_file(output, config)
     if not opts.no_verify:

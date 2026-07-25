@@ -41,7 +41,7 @@ def get_argparser():
     parser.add_argument(
         "--postprocess",
         choices=["none", "background", "balanced"],
-        default="balanced",
+        default="none",
         help=(
             "inference-only refinement: colored-paper repair, optionally with "
             "conservative print-stroke protection"
@@ -62,6 +62,10 @@ def get_argparser():
     parser.add_argument(
         "--save-postprocess-debug", action="store_true",
         help="save estimated background and every postprocessing mask",
+    )
+    parser.add_argument(
+        "--save-print-mask", action="store_true",
+        help="save layered model amodal printed-content probability",
     )
     return parser
 
@@ -142,6 +146,7 @@ def predict_tiled(model, image, device, config, tile_size, overlap, batch_size):
     coordinates = [(y, x) for y in ys for x in xs]
     num_classes = int(config.get("num_classes", 3))
     logits_sum = np.zeros((num_classes, height, width), dtype=np.float32)
+    print_sum = None
     restored_sum = None
     weight_sum = np.zeros((height, width), dtype=np.float32)
     mean, std = config.get("mean", DEFAULT_MEAN), config.get("std", DEFAULT_STD)
@@ -157,28 +162,45 @@ def predict_tiled(model, image, device, config, tile_size, overlap, batch_size):
         outputs = model(batch)
         if isinstance(outputs, (tuple, list)):
             batch_logits = outputs[0].float().cpu().numpy()
+            batch_print = (
+                outputs[1].float().cpu().numpy()
+                if len(outputs) == 4 else [None] * len(batch_coords)
+            )
+            if len(outputs) == 4 and print_sum is None:
+                print_sum = np.zeros((1, height, width), dtype=np.float32)
             batch_restored = outputs[-1].float().cpu().numpy()
             if restored_sum is None:
                 restored_sum = np.zeros((3, height, width), dtype=np.float32)
         else:
             batch_logits = outputs.float().cpu().numpy()
+            batch_print = [None] * len(batch_coords)
             batch_restored = [None] * len(batch_coords)
-        for logits, restored, (y, x) in zip(
-            batch_logits, batch_restored, batch_coords
+        for logits, print_logits, restored, (y, x) in zip(
+            batch_logits, batch_print, batch_restored, batch_coords
         ):
             h, w = logits.shape[-2:]
             weight = blend_window(h, w)
             logits_sum[:, y:y + h, x:x + w] += logits * weight[None]
             if restored_sum is not None:
                 restored_sum[:, y:y + h, x:x + w] += restored * weight[None]
+            if print_sum is not None:
+                print_sum[:, y:y + h, x:x + w] += (
+                    print_logits * weight[None]
+                )
             weight_sum[y:y + h, x:x + w] += weight
     denominator = np.maximum(weight_sum, 1e-6)
     labels = np.argmax(logits_sum / denominator, axis=0).astype(np.uint8)
     if restored_sum is None:
-        return labels, None
+        return labels, None, None
     restored = np.clip(restored_sum / denominator[None], 0.0, 1.0)
     restored = (restored.transpose(1, 2, 0) * 255.0).round().astype(np.uint8)
-    return labels, Image.fromarray(restored)
+    print_probability = None
+    if print_sum is not None:
+        print_logits = print_sum[0] / denominator
+        print_probability = 1.0 / (
+            1.0 + np.exp(-np.clip(print_logits, -30.0, 30.0))
+        )
+    return labels, Image.fromarray(restored), print_probability
 
 
 def erase_handwriting(image, labels, handwriting_class=1, dilate=1):
@@ -256,7 +278,7 @@ def main():
 
     for source in tqdm(files):
         image = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
-        labels, restored = predict_tiled(
+        labels, restored, print_probability = predict_tiled(
             model, image, device, config, opts.tile_size, opts.overlap,
             opts.tile_batch_size,
         )
@@ -291,6 +313,13 @@ def main():
             mask.save(destination.with_name(destination.stem + "_mask.png"))
         if opts.save_postprocess_debug and postprocess_debug is not None:
             save_postprocess_debug(destination, postprocess_debug)
+        if opts.save_print_mask and print_probability is not None:
+            print_mask = Image.fromarray(
+                np.clip(print_probability * 255.0, 0, 255).astype(np.uint8)
+            )
+            print_mask.save(destination.with_name(
+                destination.stem + "_print_probability.png"
+            ))
 
 
 if __name__ == "__main__":

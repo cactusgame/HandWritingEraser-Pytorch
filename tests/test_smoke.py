@@ -1,3 +1,4 @@
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,15 +15,27 @@ from datasets import (
     JointDocumentTransform,
     MultiSourceHWSegmentation,
 )
+from datasets.restoration import estimate_clean_print_mask
 from predict import tile_starts
 from tools.convert_scut_ensexam import make_three_class_label
 from tools.convert_signatr6k import convert_mask
+from tools.synthesize_clean_documents import (
+    collect_handwriting_pairs,
+    document_seed,
+    estimate_document_print_mask,
+    find_placement,
+    random_scribble_layer,
+    resolve_handwriting_roots,
+    split_documents,
+    synthesize_variant,
+)
 from utils.ext_transforms import ExtEnsureMinSize
 from utils import ModelEMA
 from utils.document_postprocess import refine_document_restoration
 from utils.loss import (
     HybridSegmentationLoss,
     JointRestorationLoss,
+    LayeredRestorationLoss,
     StructureAwareLoss,
 )
 
@@ -91,6 +104,35 @@ class UpgradeSmokeTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertIn("reconstruction", criterion.last_components)
 
+    def test_layered_model_has_amodal_print_and_separate_losses(self):
+        model = network.modeling.layered_eraser(
+            num_classes=3, output_stride=32, pretrained_backbone=False
+        )
+        inputs = torch.randn(1, 3, 65, 83)
+        labels = torch.zeros(1, 65, 83, dtype=torch.long)
+        labels[:, 20:45, 28:55] = 1
+        clean_print = torch.zeros(1, 65, 83)
+        clean_print[:, 31:34, 10:72] = 1
+        clean = torch.rand(1, 3, 65, 83)
+        outputs = model(inputs)
+        self.assertEqual(len(outputs), 4)
+        self.assertEqual(tuple(outputs[0].shape), (1, 3, 65, 83))
+        self.assertEqual(tuple(outputs[1].shape), (1, 1, 65, 83))
+        self.assertTrue(torch.all((outputs[-1] >= 0) & (outputs[-1] <= 1)))
+
+        criterion = LayeredRestorationLoss([1, 3, 2])
+        loss = criterion(
+            outputs, labels, clean, clean_print, torch.ones(1), inputs
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("background", criterion.last_components)
+        self.assertIn("overlap_reconstruction", criterion.last_components)
+        self.assertLess(
+            sum(parameter.numel() for parameter in model.parameters()),
+            30_000_000,
+        )
+
     def test_restoration_dataset_reads_paired_clean_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -113,11 +155,100 @@ class UpgradeSmokeTests(unittest.TestCase):
                 split="train",
                 val_ratio=0.5,
             )
-            image, label, clean, valid = dataset[0]
+            image, label, clean, clean_print, valid = dataset[0]
             self.assertEqual(tuple(image.shape), (3, 32, 40))
             self.assertEqual(tuple(clean.shape), (3, 32, 40))
             self.assertEqual(tuple(label.shape), (32, 40))
+            self.assertEqual(tuple(clean_print.shape), (32, 40))
             self.assertEqual(float(valid), 1.0)
+
+    def test_clean_print_mask_keeps_print_hidden_by_handwriting(self):
+        clean = np.full((40, 64, 3), 245, dtype=np.uint8)
+        clean[19:22, 8:56] = [35, 55, 120]
+        labels = np.zeros((40, 64), dtype=np.uint8)
+        labels[19:22, 8:24] = 2
+        labels[14:28, 24:40] = 1
+        mask = np.asarray(estimate_clean_print_mask(
+            Image.fromarray(clean), Image.fromarray(labels)
+        ))
+        self.assertEqual(mask[20, 12], 1)
+        self.assertEqual(mask[20, 32], 1)
+        self.assertEqual(mask[5, 5], 0)
+
+    def test_clean_document_synthesis_forces_print_overlap(self):
+        clean_array = np.full((128, 192, 3), [196, 220, 202], dtype=np.uint8)
+        clean_array[54:62, 12:180] = [22, 35, 29]
+        clean = Image.fromarray(clean_array)
+        print_mask = estimate_document_print_mask(clean)
+        self.assertGreater(np.count_nonzero(print_mask[54:62]), 0)
+
+        result = synthesize_variant(
+            clean=clean,
+            print_mask=print_mask,
+            pairs=[],
+            mode="overlap",
+            random_scribble_probability=1.0,
+            minimum_overlap=0.08,
+            high_resolution_command=None,
+            rng=random.Random(31),
+        )
+        composite, target, label, complete_print, overlap, source = result
+        self.assertEqual(composite.size, clean.size)
+        self.assertEqual(target.size, clean.size)
+        self.assertEqual(source, "procedural")
+        self.assertGreaterEqual(overlap, 0.08)
+        self.assertGreater(np.count_nonzero(label == 1), 0)
+        self.assertGreater(
+            np.count_nonzero((label == 1) & complete_print), 0
+        )
+        np.testing.assert_array_equal(np.asarray(target), clean_array)
+
+    def test_synthesis_placement_and_document_splits_do_not_leak(self):
+        alpha = np.zeros((20, 30), dtype=np.float32)
+        alpha[8:12, 2:28] = 1.0
+        print_mask = np.zeros((60, 90), dtype=bool)
+        print_mask[28:32, 5:85] = True
+        placement = find_placement(
+            alpha, print_mask, "overlap", 0.5, random.Random(7)
+        )
+        self.assertIsNotNone(placement)
+        self.assertGreaterEqual(placement[2], 0.5)
+
+        documents = [Path("document_%02d.png" % index) for index in range(10)]
+        splits = split_documents(documents, 0.2, 0.2, seed=5)
+        self.assertEqual(sum(map(len, splits.values())), len(documents))
+        self.assertTrue(set(splits["train"]).isdisjoint(splits["validation"]))
+        self.assertTrue(set(splits["train"]).isdisjoint(splits["test"]))
+        self.assertTrue(
+            set(splits["validation"]).isdisjoint(splits["test"])
+        )
+
+    def test_handwriting_parent_root_discovery_and_worker_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            dataset = parent / "converted"
+            (dataset / "Images").mkdir(parents=True)
+            (dataset / "Labels").mkdir()
+            Image.new("RGB", (24, 16), "white").save(
+                dataset / "Images" / "sample.png"
+            )
+            label = np.zeros((16, 24), dtype=np.uint8)
+            label[5:9, 6:18] = 1
+            Image.fromarray(label).save(
+                dataset / "Labels" / "sample.png"
+            )
+            roots = resolve_handwriting_roots([parent])
+            self.assertEqual(roots, [dataset.resolve()])
+            self.assertEqual(len(collect_handwriting_pairs(roots)), 1)
+
+        self.assertEqual(
+            document_seed(17, "train", 4),
+            document_seed(17, "train", 4),
+        )
+        self.assertNotEqual(
+            document_seed(17, "train", 4),
+            document_seed(17, "validation", 4),
+        )
 
     def test_tiles_cover_the_last_pixel(self):
         starts = tile_starts(1500, 768, 128)
