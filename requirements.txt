@@ -3,6 +3,7 @@ torchvision>=0.16
 numpy>=1.23
 pillow>=9.5
 tqdm>=4.65
+opencv-python-headless>=4.8
 onnx>=1.16
 onnxruntime>=1.18
 tensorboard>=2.14

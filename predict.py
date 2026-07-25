@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 import network
 from utils.checkpoint import checkpoint_model_config, clean_state_dict
+from utils.document_postprocess import refine_document_restoration
 
 
 DEFAULT_MEAN = [0.485, 0.456, 0.406]
@@ -37,6 +38,31 @@ def get_argparser():
     parser.add_argument("--dilate", type=int, default=1,
                         help="mask dilation radius in pixels")
     parser.add_argument("--save-mask", action="store_true")
+    parser.add_argument(
+        "--postprocess",
+        choices=["none", "background", "balanced"],
+        default="balanced",
+        help=(
+            "inference-only refinement: colored-paper repair, optionally with "
+            "conservative print-stroke protection"
+        ),
+    )
+    parser.add_argument(
+        "--print-class", type=int, default=2,
+        help="printed-content class used by balanced postprocessing",
+    )
+    parser.add_argument(
+        "--postprocess-inpaint-radius", type=int, default=5,
+        help="local background interpolation radius",
+    )
+    parser.add_argument(
+        "--postprocess-max-gap", type=int, default=7,
+        help="largest short printed-stroke gap to reconnect; 0 disables it",
+    )
+    parser.add_argument(
+        "--save-postprocess-debug", action="store_true",
+        help="save estimated background and every postprocessing mask",
+    )
     return parser
 
 
@@ -191,6 +217,25 @@ def output_path_for(source, input_root, output, multiple):
     return destination
 
 
+def save_postprocess_debug(destination, debug):
+    images = {
+        "background": Image.fromarray(debug.estimated_background),
+        "background_repair": Image.fromarray(
+            debug.background_repair.astype(np.uint8) * 255
+        ),
+        "protected_print": Image.fromarray(
+            debug.protected_source_ink.astype(np.uint8) * 255
+        ),
+        "bridged_print": Image.fromarray(
+            debug.bridged_print.astype(np.uint8) * 255
+        ),
+    }
+    for suffix, image in images.items():
+        image.save(destination.with_name(
+            destination.stem + "_" + suffix + ".png"
+        ))
+
+
 def main():
     opts = get_argparser().parse_args()
     device = resolve_device(opts.device)
@@ -201,6 +246,10 @@ def main():
         raise ValueError("handwriting-class is outside the model class range")
     if opts.dilate < 0:
         raise ValueError("dilate must be non-negative")
+    if opts.postprocess_inpaint_radius <= 0:
+        raise ValueError("postprocess-inpaint-radius must be positive")
+    if opts.postprocess_max_gap < 0:
+        raise ValueError("postprocess-max-gap must be non-negative")
     files, input_root = collect_inputs(opts.input)
     print("device: %s, model: %s, images: %d" %
           (device, config.get("model", "torchscript"), len(files)))
@@ -220,12 +269,28 @@ def main():
             mask = Image.fromarray(
                 (labels == opts.handwriting_class).astype(np.uint8) * 255
             )
+        postprocess_debug = None
+        if opts.postprocess != "none":
+            result, postprocess_debug = refine_document_restoration(
+                image,
+                result,
+                labels,
+                handwriting_class=opts.handwriting_class,
+                print_class=opts.print_class,
+                mask_dilate=opts.dilate,
+                inpaint_radius=opts.postprocess_inpaint_radius,
+                max_print_gap=opts.postprocess_max_gap,
+                mode=opts.postprocess,
+                return_debug=True,
+            )
         destination = output_path_for(
             source, input_root, opts.output, len(files) > 1
         )
         result.save(destination)
         if opts.save_mask:
             mask.save(destination.with_name(destination.stem + "_mask.png"))
+        if opts.save_postprocess_debug and postprocess_debug is not None:
+            save_postprocess_debug(destination, postprocess_debug)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from tools.convert_scut_ensexam import make_three_class_label
 from tools.convert_signatr6k import convert_mask
 from utils.ext_transforms import ExtEnsureMinSize
 from utils import ModelEMA
+from utils.document_postprocess import refine_document_restoration
 from utils.loss import (
     HybridSegmentationLoss,
     JointRestorationLoss,
@@ -236,6 +237,55 @@ class UpgradeSmokeTests(unittest.TestCase):
         )
         self.assertEqual(writer.scalars["validation/macro/Handwriting_IoU"], (0.6, 12))
         self.assertTrue(writer.flushed)
+
+    def test_postprocess_repairs_white_fill_on_colored_paper(self):
+        original = np.full((48, 96, 3), [198, 220, 204], dtype=np.uint8)
+        labels = np.zeros((48, 96), dtype=np.uint8)
+        labels[14:36, 38:62] = 1
+        restored = original.copy()
+        restored[labels == 1] = 255
+
+        result, debug = refine_document_restoration(
+            Image.fromarray(original),
+            Image.fromarray(restored),
+            labels,
+            mask_dilate=0,
+            mode="background",
+            return_debug=True,
+        )
+        result = np.asarray(result)
+
+        self.assertGreater(np.count_nonzero(debug.background_repair), 0)
+        self.assertLess(
+            np.abs(result[24, 48].astype(int) - original[24, 48]).max(), 5
+        )
+        np.testing.assert_array_equal(result[0, 0], restored[0, 0])
+
+    def test_postprocess_bridges_short_print_gap_without_restoring_color_ink(self):
+        original = np.full((60, 160, 3), 255, dtype=np.uint8)
+        original[29:32, 15:145] = 20
+        # A colored handwritten stroke covers a short section of the print line.
+        original[10:50, 77:83] = [35, 80, 210]
+        labels = np.zeros((60, 160), dtype=np.uint8)
+        labels[29:32, 15:145] = 2
+        labels[10:50, 77:83] = 1
+        restored = original.copy()
+        restored[labels == 1] = 255
+
+        result, debug = refine_document_restoration(
+            original,
+            restored,
+            labels,
+            mask_dilate=0,
+            max_print_gap=7,
+            mode="balanced",
+            return_debug=True,
+        )
+        result = np.asarray(result)
+
+        self.assertTrue(np.all(result[30, 77:83].mean(axis=1) < 80))
+        self.assertTrue(np.all(result[15, 77:83] > 240))
+        self.assertGreater(np.count_nonzero(debug.bridged_print), 0)
 
 
 if __name__ == "__main__":

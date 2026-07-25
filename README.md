@@ -192,6 +192,31 @@ python predict.py \
 
 目录可作为输入和输出，目录层级会保留。`--save-mask` 可同时保存手写 mask，`--threads` 控制 CPU 线程数。
 
+推理默认启用不需要重新训练的 `balanced` 后处理：
+
+- 仅在手写 mask 内，把与邻域纸张颜色明显冲突的纯白输出替换为局部背景；
+- 从原图保留与印刷类别相连的深色低彩度像素；
+- 沿水平、垂直和两个对角方向连接最长 7 像素的短印刷断点。
+
+它不会修改 mask 外的像素，也不会对整页文字执行闭运算。可以保存中间结果检查每次修改：
+
+```bash
+python predict.py \
+  --input samples/input.jpg \
+  --output results/output.png \
+  --checkpoint checkpoints/best.pth \
+  --postprocess balanced \
+  --postprocess-max-gap 7 \
+  --save-mask \
+  --save-postprocess-debug
+```
+
+调试文件包括 `_background.png`、`_background_repair.png`、
+`_protected_print.png` 和 `_bridged_print.png`。如果原稿使用黑色手写且出现误保留，
+可把 `--postprocess-max-gap` 降为 `3`，或使用
+`--postprocess background` 只修纸张颜色；`--postprocess none` 完全恢复旧推理行为。
+完全被手写覆盖且两侧没有印刷结构证据的内容无法通过这类确定性后处理可靠重建。
+
 ### 导出 CPU TorchScript
 
 TorchScript 不依赖训练脚本中的 Python 模型定义，适合部署：
