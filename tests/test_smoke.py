@@ -20,9 +20,12 @@ from predict import tile_starts
 from tools.convert_scut_ensexam import make_three_class_label
 from tools.convert_signatr6k import convert_mask
 from tools.synthesize_clean_documents import (
+    _extract_handwriting_alpha,
+    analyze_document_layout,
     collect_handwriting_pairs,
     document_seed,
     estimate_document_print_mask,
+    find_answer_line_placement,
     find_placement,
     random_scribble_layer,
     resolve_handwriting_roots,
@@ -203,6 +206,46 @@ class UpgradeSmokeTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(np.asarray(target), clean_array)
 
+    def test_synthetic_print_mask_keeps_original_stroke_width(self):
+        clean = np.full((80, 180, 3), 247, dtype=np.uint8)
+        clean[38:40, 20:160] = [25, 35, 45]
+        mask = estimate_document_print_mask(Image.fromarray(clean))
+        self.assertGreater(np.count_nonzero(mask[38:40, 20:160]), 200)
+        self.assertEqual(np.count_nonzero(mask[:36]), 0)
+        self.assertEqual(np.count_nonzero(mask[42:]), 0)
+
+    def test_coarse_handwriting_label_is_reduced_to_visible_strokes(self):
+        source = np.full((72, 120, 3), 242, dtype=np.uint8)
+        source[33:36, 24:96] = [35, 70, 155]
+        coarse = np.zeros((72, 120), dtype=bool)
+        coarse[20:52, 12:108] = True
+        alpha = _extract_handwriting_alpha(source, coarse)
+        self.assertGreater(float(alpha[34, 60]), 0.7)
+        self.assertLess(float(alpha[24, 60]), 0.05)
+        self.assertLess(
+            np.count_nonzero(alpha >= 0.10),
+            np.count_nonzero(coarse) * 0.30,
+        )
+
+    def test_answer_text_is_placed_on_detected_answer_line(self):
+        print_mask = np.zeros((180, 260), dtype=bool)
+        print_mask[100:102, 45:215] = True
+        layout = analyze_document_layout(print_mask)
+        self.assertEqual(len(layout["answer_lines"]), 1)
+        alpha = np.zeros((24, 80), dtype=np.float32)
+        alpha[5:20, 3:77] = 1.0
+        result = find_answer_line_placement(
+            alpha,
+            print_mask,
+            np.zeros_like(print_mask),
+            layout,
+            random.Random(13),
+        )
+        self.assertIsNotNone(result)
+        placed_alpha, (_, top, overlap) = result
+        self.assertLess(top + placed_alpha.shape[0], 108)
+        self.assertLessEqual(overlap, 0.10)
+
     def test_synthesis_placement_and_document_splits_do_not_leak(self):
         alpha = np.zeros((20, 30), dtype=np.float32)
         alpha[8:12, 2:28] = 1.0
@@ -236,6 +279,13 @@ class UpgradeSmokeTests(unittest.TestCase):
             label[5:9, 6:18] = 1
             Image.fromarray(label).save(
                 dataset / "Labels" / "sample.png"
+            )
+            generated = parent / "previous-synthetic-output"
+            (generated / "Images").mkdir(parents=True)
+            (generated / "Labels").mkdir()
+            (generated / "dataset.json").write_text(
+                '{"name": "CleanDocumentSynthetic"}',
+                encoding="utf-8",
             )
             roots = resolve_handwriting_roots([parent])
             self.assertEqual(roots, [dataset.resolve()])

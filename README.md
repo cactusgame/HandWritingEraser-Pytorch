@@ -167,24 +167,31 @@ Poppler；macOS 可运行 `brew install poppler`，Ubuntu/Debian 可运行
 `sudo apt-get install poppler-utils`。
 
 准备没有手写的试卷、合同或其他文档图片后，使用下面的脚本。它会从原三份数据的
-类别 1 区域提取真实笔迹形状和颜色，也会生成随机涂写、下划线和批注。默认样本
-组成是：
+类别 1 区域重新提取真实的中英文笔画（旧标签只用于定位，不直接作为笔迹透明度），
+也会少量生成勾、叉和乱写乱画。脚本先检测答题横线和印刷内容边界，再决定落点。
+默认行为是：
 
-- 25% 不添加手写的干净负样本，用于抑制彩色背景、彩色文字和图章误检；
-- 45% 强制让手写覆盖印刷内容，用于学习补齐被遮挡的文字和线条；
-- 30% 主要落在背景上，用于学习纸张、彩色面板和底纹的真实颜色。
+- 10% 为完全不添加手写的干净负样本，用于抑制彩色背景、彩色文字和图章误检；
+- 每个非负样本添加 3～7 个笔迹，真实文字优先放在答题横线或临近题目的空白区；
+- 35% 的非负样本会将其中一个笔迹改成与印刷内容轻微重合的勾、叉、圈或下划线；
+- 8% 的非负样本会将其中一个笔迹改成随机涂写，避免乱写乱画占比过高。
 
 ```bash
 python tools/synthesize_clean_documents.py \
-  --clean-root /path/to/clean-exam-images \
-  --clean-root /path/to/clean-contract-images \
-  --output /Users/peng/Documents/data/HandWritingData/CleanDocumentSynthetic \
+  --clean-root /Users/peng/Documents/data/exersice_images \
+  --handwriting-root /Users/peng/Documents/data/HandWritingData \
+  --output /Users/peng/Documents/data/HandWritingData/exersice_images-baidu-format \
   --variants-per-document 5 \
-  --clean-negative-ratio 0.25 \
-  --overlap-ratio 0.45 \
-  --random-scribble-probability 0.25 \
-  --minimum-print-overlap 0.12 \
+  --clean-negative-ratio 0.10 \
+  --min-annotations 3 \
+  --max-annotations 7 \
+  --print-mask-method doc3d-adaptive \
+  --overlap-ratio 0.35 \
+  --random-scribble-probability 0.08 \
+  --minimum-print-overlap 0.04 \
   --workers 4 \
+  --preview-count 24 \
+  --overwrite \
   --seed 17
 ```
 
@@ -201,13 +208,20 @@ python tools/synthesize_clean_documents.py \
 背景 0、手写 1、印刷 2 标签。
 
 并行以“一个干净文档”为任务单位，同一页的印刷 mask 只计算一次，再连续生成该页
-的多个变体。随机种子按 split 和文档编号独立派生，因此改变 worker 数不会改变
-样本内容。每个 worker 会同时保存一张完整页面及其多个 mask；普通 300 DPI A4
+的多个变体。真实笔迹会被整理成小型候选片段缓存，不会在每次粘贴时长期持有全部
+旧数据原图。随机种子按 split 和文档编号独立派生，因此改变 worker 数不会改变
+样本内容。每个 worker 仍会同时持有一张完整页面及其多个 mask；普通 300 DPI A4
 建议 `--workers 4`，内存充足时可增加到 `8`。
 
-如果只需要随机乱写乱画，可传
-`--random-scribble-probability 1`，此时不需要旧手写数据。脚本先按原始干净文档
-切分 train/validation/test，再为每页生成多个变体，所以同一页不会跨 split 泄漏。
+如果只需要随机乱写乱画，可传 `--random-scribble-probability 1`，此时不需要旧
+手写数据。正常训练不建议这样做，因为真实中英文笔迹应当占主要比例。脚本先按
+原始干净文档切分 train/validation/test，再为每页生成多个变体，所以同一页不会
+跨 split 泄漏。`CleanPrintMasks` 使用与
+`doc_clean/data/doc3d/gen_seg_text.py` 相同的“横向高斯滤波 + 自适应高斯阈值
++ 反相”流程，不执行膨胀，也不再使用会产生块状区域的局部残差填充。默认的
+`doc3d-adaptive` 适合不均匀或彩色背景；背景非常均匀时也可以尝试
+`--print-mask-method doc3d-otsu`。自适应阈值还可通过
+`--print-mask-block-size`（奇数，默认 11）和 `--print-mask-c`（默认 2）调整。
 输出与训练代码直接兼容：
 
 ```text
@@ -221,6 +235,25 @@ CleanDocumentSynthetic/
 ├── dataset.json         # 数量、像素和重叠统计
 └── preview.jpg          # 输入 / 干净目标 / 标签三列抽检图
 ```
+
+每个非负样本的手写数量由 `--min-annotations` 和 `--max-annotations` 控制。例如
+固定添加 8 个笔迹：
+
+```bash
+--min-annotations 8 --max-annotations 8 --clean-negative-ratio 0
+```
+
+需要随机添加 5～10 个则使用：
+
+```bash
+--min-annotations 5 --max-annotations 10
+```
+
+`--clean-negative-ratio` 决定有多少页面完全不添加手写；默认 0.10。勾画和涂写会
+替换上述数量中的一个，不会额外增加总数。`--variants-per-document` 控制每张干净
+图生成多少个页面变体，不是单页笔迹数量。如果页面找不到足够安全的空白位置，实际
+数量可能略少；每张图的实际数量记录在 `provenance.jsonl` 的
+`annotation_count` 中。
 
 若干净图片还是高分辨率修复之前的原图，可以通过
 `--high-resolution-command` 接入与线上完全相同的本地处理程序。命令必须包含
